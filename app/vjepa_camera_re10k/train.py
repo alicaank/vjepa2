@@ -435,9 +435,15 @@ def main(args, resume_preempt=False):
             def load_batch():
                 # images: [B, T, 3, H, W] → encoder expects [B, C, T, H, W]
                 imgs = sample["images"].to(device, non_blocking=True)
-                states = sample["states"].to(device, dtype=torch.float, non_blocking=True)      # [B, T, 7]
-                actions = sample["actions"].to(device, dtype=torch.float, non_blocking=True)    # [B, T, 7]
-                intrinsics = sample["intrinsics"].to(device, dtype=torch.float, non_blocking=True)  # [B, T, 4]
+                # Dataset yields per-frame poses (T=seq_len).
+                # Predictor expects per-tubelet poses (T//tubelet_size).
+                # Subsample: take one pose per tubelet (first frame of each).
+                s = sample["states"].to(device, dtype=torch.float, non_blocking=True)       # [B, T, 7]
+                a = sample["actions"].to(device, dtype=torch.float, non_blocking=True)      # [B, T, 7]
+                k = sample["intrinsics"].to(device, dtype=torch.float, non_blocking=True)   # [B, T, 4]
+                states     = s[:, ::tubelet_size, :]   # [B, T//ts, 7]
+                actions    = a[:, ::tubelet_size, :]   # [B, T//ts, 7]
+                intrinsics = k[:, ::tubelet_size, :]   # [B, T//ts, 4]
                 return imgs, states, actions, intrinsics
 
             imgs, states, actions, intrinsics = load_batch()
