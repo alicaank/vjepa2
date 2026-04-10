@@ -318,7 +318,7 @@ def main(args, resume_preempt=False):
     )
 
     encoder = DistributedDataParallel(encoder, static_graph=True)
-    predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
+    predictor = DistributedDataParallel(predictor, static_graph=True)
     target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
@@ -528,7 +528,7 @@ def main(args, resume_preempt=False):
                     optimizer.step()
                 optimizer.zero_grad()
 
-                return float(loss), float(loss_pred), float(loss_ctx), _new_lr, _new_wd
+                return loss.item(), loss_pred.item(), loss_ctx.item(), _new_lr, _new_wd
 
             (loss, loss_pred, loss_ctx, _new_lr, _new_wd), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
