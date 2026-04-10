@@ -16,6 +16,8 @@ from src.utils.logging import get_logger
 logger = get_logger(os.path.basename(__file__))
 
 _HF_PREFIX = "hf://"
+_HTTPS_PREFIX = "https://"
+_HTTP_PREFIX = "http://"
 
 
 def _resolve_hf_path(r_path: str) -> str:
@@ -44,13 +46,17 @@ def _resolve_hf_path(r_path: str) -> str:
 
 def robust_checkpoint_loader(r_path: str, map_location: MAP_LOCATION = "cpu", max_retries: int = 3) -> Any:
     """
-    Loads a checkpoint from a local path or a HuggingFace Hub path.
+    Loads a checkpoint from a local path, a HuggingFace Hub path, or an HTTPS URL.
 
-    HuggingFace paths use the format:  hf://<org>/<repo>/<filename>
-    e.g.  hf://facebook/vjepa2-vitl/vitl.pt
+    HuggingFace paths:  hf://<org>/<repo>/<filename>
+    Direct URLs:        https://... or http://...
+    e.g.  https://dl.fbaipublicfiles.com/vjepa2/vitl.pt
     """
     if r_path.startswith(_HF_PREFIX):
         r_path = _resolve_hf_path(r_path)
+    elif r_path.startswith(_HTTPS_PREFIX) or r_path.startswith(_HTTP_PREFIX):
+        logger.info(f"Downloading checkpoint from URL: {r_path}")
+        return torch.hub.load_state_dict_from_url(r_path, map_location=map_location)
 
     retries = 0
 

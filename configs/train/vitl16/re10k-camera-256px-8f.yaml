@@ -1,6 +1,6 @@
 app: vjepa_camera_re10k
 cpus_per_task: 8
-folder: /your_folder/re10k/camera-vitl16-384px-8f
+folder: /home/ak/GWM/predictor_output
 mem_per_gpu: 80G
 nodes: 2
 tasks_per_node: 8
@@ -26,7 +26,7 @@ meta:
   load_encoder: true
   # V-JEPA2 ViT-L pretrained weights loaded via HuggingFace Hub.
   # Format: hf://<org>/<repo>/<filename>
-  pretrain_checkpoint: hf://facebook/vjepa2/vitl.pt
+  pretrain_checkpoint: https://dl.fbaipublicfiles.com/vjepa2/vitl.pt
   context_encoder_key: target_encoder
   target_encoder_key: target_encoder
   save_every_freq: 25
