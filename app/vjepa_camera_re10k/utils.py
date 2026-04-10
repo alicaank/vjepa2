@@ -111,6 +111,18 @@ def init_video_model(
     use_intrinsics=True,
     predict_all=True,
 ):
+    # Build the encoder.  We instantiate it first without out_layers to read
+    # the total block depth, then reinitialise with the last n_hierarchical_layers.
+    _enc_tmp = video_vit.__dict__[model_name](
+        img_size=crop_size, patch_size=patch_size, num_frames=max_num_frames,
+        tubelet_size=tubelet_size, uniform_power=uniform_power, use_sdpa=use_sdpa,
+        use_silu=use_silu, wide_silu=wide_silu,
+        use_activation_checkpointing=use_activation_checkpointing, use_rope=use_rope,
+    )
+    n_blocks = len(_enc_tmp.blocks)
+    del _enc_tmp
+    # Collect the last n_hierarchical_layers block indices
+    out_layers = list(range(n_blocks - n_hierarchical_layers, n_blocks))
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,
@@ -122,6 +134,7 @@ def init_video_model(
         wide_silu=wide_silu,
         use_activation_checkpointing=use_activation_checkpointing,
         use_rope=use_rope,
+        out_layers=out_layers,
     )
 
     _out_embed_dim = out_embed_dim if out_embed_dim is not None else encoder.embed_dim

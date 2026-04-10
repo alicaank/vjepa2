@@ -453,13 +453,16 @@ def main(args, resume_preempt=False):
 
                 def forward_target():
                     with torch.no_grad():
-                        # encoder expects [B, C, T, H, W]
+                        # encoder expects [B, C, T, H, W]; returns list of
+                        # n_hierarchical_layers tensors each [B, N, D]
                         clip = imgs.permute(0, 2, 1, 3, 4)
-                        # training=True → returns multi-layer concat [B, T*HW, n_layers*D]
-                        h = target_encoder(clip, training=True)
+                        layer_outs = target_encoder(clip)   # list[Tensor[B,N,D]]
                         if normalize_reps:
-                            embed_dim = h.shape[-1] // n_hierarchical_layers
-                            h = _normalize_and_concat(h, embed_dim)
+                            layer_outs = [
+                                F.layer_norm(feat, (feat.size(-1),))
+                                for feat in layer_outs
+                            ]
+                        h = torch.cat(layer_outs, dim=-1)   # [B, N, n_layers*D]
                         return h
 
                 def forward_predictor(h):
