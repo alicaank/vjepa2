@@ -25,11 +25,10 @@ meta:
   resume_checkpoint: null
   load_predictor: false
   load_encoder: true
-  # V-JEPA2 ViT-L pretrained weights loaded via HuggingFace Hub.
-  # Format: hf://<org>/<repo>/<filename>
-  pretrain_checkpoint: https://dl.fbaipublicfiles.com/vjepa2/vitl.pt
-  context_encoder_key: target_encoder
-  target_encoder_key: target_encoder
+  # V-JEPA 2.1 ViT-L checkpoint (distilled from ViT-G teacher, 384px)
+  pretrain_checkpoint: https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt
+  context_encoder_key: ema_encoder
+  target_encoder_key: ema_encoder
   save_every_freq: 25
   seed: 42
   use_sdpa: true
