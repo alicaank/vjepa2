@@ -184,6 +184,9 @@ def main(args, resume_preempt=False):
     pin_mem = cfgs_data.get("pin_mem", True)
     num_workers = cfgs_data.get("num_workers", 8)
     persistent_workers = cfgs_data.get("persistent_workers", True)
+    # Number of context tubelets shown to the context encoder.
+    # The predictor must hallucinate the remaining (T_tok - n_ctx_tubelets) tubelets.
+    n_ctx_tubelets = cfgs_data.get("n_ctx_tubelets", 1)
 
     # -- LOSS
     cfgs_loss = args.get("loss")
@@ -457,34 +460,68 @@ def main(args, resume_preempt=False):
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
 
-                def forward_target():
-                    with torch.no_grad():
-                        # encoder expects [B, C, T, H, W]; returns list of
-                        # n_hierarchical_layers tensors each [B, N, D]
-                        clip = imgs.permute(0, 2, 1, 3, 4)
-                        layer_outs = target_encoder(clip)   # list[Tensor[B,N,D]]
-                        if normalize_reps:
-                            layer_outs = [
-                                F.layer_norm(feat, (feat.size(-1),))
-                                for feat in layer_outs
-                            ]
-                        h = torch.cat(layer_outs, dim=-1)   # [B, N, n_layers*D]
-                        return h
+                HW = (crop_size // patch_size) ** 2          # spatial tokens per tubelet
+                T_tok = seq_len // tubelet_size               # total tubelets
 
-                def forward_predictor(h):
+                def _layerlist_to_h(layer_outs):
+                    """list[Tensor[B, T_tok*HW, D]] → [B, T_tok*HW, n_layers*D]"""
+                    if normalize_reps:
+                        layer_outs = [
+                            F.layer_norm(feat, (feat.size(-1),))
+                            for feat in layer_outs
+                        ]
+                    return torch.cat(layer_outs, dim=-1)
+
+                # ------------------------------------------------------------ #
+                # 1. TARGET: frozen target_encoder sees the FULL clip
+                # ------------------------------------------------------------ #
+                with torch.no_grad():
+                    full_clip = imgs.permute(0, 2, 1, 3, 4)   # [B, C, T, H, W]
+                    h_target = _layerlist_to_h(target_encoder(full_clip))
+                    # h_target: [B, T_tok*HW, n_layers*D]  — ground truth for loss
+
+                # ------------------------------------------------------------ #
+                # 2. CONTEXT: context encoder sees only the first n_ctx_tubelets
+                # ------------------------------------------------------------ #
+                ctx_frames = n_ctx_tubelets * tubelet_size    # raw frames for context
+                ctx_clip = imgs[:, :ctx_frames, :, :, :].permute(0, 2, 1, 3, 4)
+                # encoder runs WITH grad so it can be fine-tuned (enc_lr_scale)
+                ctx_layer_outs = encoder(ctx_clip)            # list[Tensor[B, n_ctx*HW, D]]
+                h_context = _layerlist_to_h(ctx_layer_outs)  # [B, n_ctx*HW, n_layers*D]
+
+                # ------------------------------------------------------------ #
+                # 3. PAD future frames with zeros → predictor input
+                # The causal mask prevents future tokens from attending to each
+                # other, so zero-padding is safe: they carry no signal.
+                # ------------------------------------------------------------ #
+                B_sz, N_ctx, D_full = h_context.shape
+                N_future = (T_tok - n_ctx_tubelets) * HW
+                padding = torch.zeros(
+                    B_sz, N_future, D_full,
+                    device=h_context.device, dtype=h_context.dtype,
+                )
+                h_predictor_input = torch.cat([h_context, padding], dim=1)
+                # h_predictor_input: [B, T_tok*HW, n_layers*D]
+
+                # ------------------------------------------------------------ #
+                # 4. PREDICTOR: roll out all T_tok tubelets from actions
+                # ------------------------------------------------------------ #
+                def forward_predictor():
                     preds, ctx_preds = predictor(
-                        h,
+                        h_predictor_input,
                         actions,
                         states,
                         intrinsics=intrinsics if use_intrinsics else None,
                     )
                     return preds, ctx_preds
 
-                def loss_fn(preds, ctx_preds, h):
-                    embed_dim = h.shape[-1] // n_hierarchical_layers
-                    chunk = embed_dim
-                    pred_chunks = preds.split(chunk, dim=-1)
-                    h_chunks = h.split(chunk, dim=-1)
+                # ------------------------------------------------------------ #
+                # 5. LOSS: predictor output vs frozen target features
+                # ------------------------------------------------------------ #
+                def loss_fn(preds, ctx_preds, h_tgt):
+                    embed_dim = h_tgt.shape[-1] // n_hierarchical_layers
+                    pred_chunks = preds.split(embed_dim, dim=-1)
+                    h_chunks    = h_tgt.split(embed_dim, dim=-1)
                     loss_pred = preds.new_zeros(())
                     for p, t in zip(pred_chunks, h_chunks):
                         t = t.detach()
@@ -498,8 +535,11 @@ def main(args, resume_preempt=False):
 
                     loss_ctx = preds.new_zeros(())
                     if ctx_preds is not None:
-                        ctx_chunks = ctx_preds.split(chunk, dim=-1)
-                        for p, t in zip(ctx_chunks, h_chunks):
+                        # Dense context loss: only compare the context tubelet slots
+                        n_ctx_toks = n_ctx_tubelets * HW
+                        ctx_chunks = ctx_preds[:, :n_ctx_toks].split(embed_dim, dim=-1)
+                        h_ctx_chunks = h_tgt[:, :n_ctx_toks].split(embed_dim, dim=-1)
+                        for p, t in zip(ctx_chunks, h_ctx_chunks):
                             t = t.detach()
                             if normalize_reps:
                                 p = F.layer_norm(p, (p.size(-1),))
@@ -512,9 +552,8 @@ def main(args, resume_preempt=False):
                     return loss_pred + loss_ctx, loss_pred, loss_ctx
 
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_target()
-                    preds, ctx_preds = forward_predictor(h)
-                    loss, loss_pred, loss_ctx = loss_fn(preds, ctx_preds, h)
+                    preds, ctx_preds = forward_predictor()
+                    loss, loss_pred, loss_ctx = loss_fn(preds, ctx_preds, h_target)
 
                 if mixed_precision:
                     scaler.scale(loss).backward()

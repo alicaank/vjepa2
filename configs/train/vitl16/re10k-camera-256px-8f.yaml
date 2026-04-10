@@ -13,6 +13,7 @@ data:
   seq_len: 8          # temporal frames per clip
   stride: 4           # temporal stride between sampled frames
   min_stride: 1       # fallback stride for short clips
+  n_ctx_tubelets: 1   # tubelets shown to context encoder; predictor predicts the rest
   num_workers: 8
   pin_mem: true
   persistent_workers: true
