@@ -427,10 +427,14 @@ def main(args, resume_preempt=False):
             "world_size": world_size,
             "lr": lr,
         }
+        tmp_path = path + ".tmp"
         try:
-            torch.save(save_dict, path)
+            torch.save(save_dict, tmp_path)
+            os.replace(tmp_path, path)
         except Exception as e:
             logger.info(f"Encountered exception when saving checkpoint: {e}")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     logger.info("Initializing loader...")
     unsupervised_sampler.set_epoch(start_epoch)
@@ -460,6 +464,8 @@ def main(args, resume_preempt=False):
     # ------------------------------------------------------------------ #
     for epoch in range(start_epoch, num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
+        unsupervised_sampler.set_epoch(epoch)
+        loader = iter(unsupervised_loader)
 
         loss_meter = AverageMeter()
         loss_pred_meter = AverageMeter()
@@ -606,7 +612,7 @@ def main(args, resume_preempt=False):
 
                     return loss_pred + loss_ctx, loss_pred, loss_ctx
 
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
                     preds, ctx_preds = forward_predictor()
                     loss, loss_pred, loss_ctx = loss_fn(preds, ctx_preds, h_target)
 
