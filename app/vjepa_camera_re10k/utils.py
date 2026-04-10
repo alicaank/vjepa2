@@ -144,7 +144,7 @@ def init_video_model(
         patch_size=patch_size,
         num_frames=max_num_frames,
         tubelet_size=tubelet_size,
-        embed_dim=encoder.embed_dim * n_hierarchical_layers,
+        embed_dim=encoder.embed_dim,
         predictor_embed_dim=pred_embed_dim,
         n_hierarchical_layers=n_hierarchical_layers,
         out_embed_dim=_out_embed_dim,
