@@ -35,6 +35,7 @@ from torch.utils.data.distributed import DistributedSampler
 from app.vjepa_camera_re10k.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+from src.training.visualization import visualize_pca_features
 
 log_timings = True
 log_freq = 10
@@ -200,6 +201,8 @@ def main(args, resume_preempt=False):
     fixed_manifest_path = cfgs_data.get("fixed_manifest_path", None)
     local_chunk_cache_dir = cfgs_data.get("local_chunk_cache_dir", None)
     local_chunk_cache_limit_gb = float(cfgs_data.get("local_chunk_cache_limit_gb", 0.0))
+    eval_fixed_manifest_path = cfgs_data.get("eval_fixed_manifest_path", None)
+    n_pca_scenes = int(cfgs_data.get("n_pca_scenes", 4))
 
     # -- LOSS
     cfgs_loss = args.get("loss")
@@ -296,6 +299,37 @@ def main(args, resume_preempt=False):
         predictor = torch.compile(predictor)
 
     # -- init data
+    # -- init eval loader for PCA visualisation (test split, no DDP sampler)
+    pca_vis_dir = os.path.join(folder, "pca_vis")
+    os.makedirs(pca_vis_dir, exist_ok=True)
+    try:
+        gwm_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+        if gwm_root not in sys.path:
+            sys.path.insert(0, gwm_root)
+        from src.core.dataset import RE10KLazySceneDataset
+        from src.training.multiscene.re10k_sequence_dataset import RE10KSequenceDataset, collate_re10k_sequences
+        _eval_lazy = RE10KLazySceneDataset(
+            root=data_root, stage="test",
+            image_size=crop_size,
+            manifest_cache_dir=manifest_cache_dir,
+            fixed_manifest_path=eval_fixed_manifest_path,
+            local_chunk_cache_dir=local_chunk_cache_dir,
+            local_chunk_cache_limit_gb=local_chunk_cache_limit_gb,
+        )
+        _eval_ds = RE10KSequenceDataset(
+            lazy_dataset=_eval_lazy, seq_len=seq_len, stride=stride,
+            min_stride=min_stride, image_size=crop_size,
+        )
+        pca_loader = DataLoader(
+            _eval_ds, batch_size=1, shuffle=False,
+            num_workers=2, pin_memory=False,
+            collate_fn=collate_re10k_sequences, drop_last=False,
+        )
+        logger.info(f"PCA eval loader: {len(_eval_ds)} test scenes")
+    except Exception as _e:
+        pca_loader = None
+        logger.warning(f"PCA eval loader unavailable: {_e}")
+
     unsupervised_loader, unsupervised_sampler = _init_re10k_loader(
         data_root=data_root,
         seq_len=seq_len,
@@ -627,3 +661,53 @@ def main(args, resume_preempt=False):
             if save_every_freq > 0 and epoch % save_every_freq == 0:
                 save_every_path = os.path.join(folder, f"e{epoch}.pt")
                 save_checkpoint(epoch + 1, save_every_path)
+
+        # -- PCA feature visualisation on test scenes
+        if pca_loader is not None and (save_every_freq > 0 and epoch % save_every_freq == 0):
+            logger.info("Running PCA feature visualisation...")
+            grid_h = grid_w = crop_size // patch_size
+            HW = grid_h * grid_w
+            T_tok = seq_len // tubelet_size
+            ctx_frames_eval = n_ctx_tubelets * tubelet_size
+            _enc = target_encoder.module if hasattr(target_encoder, "module") else target_encoder
+            _pred = predictor.module if hasattr(predictor, "module") else predictor
+            _enc.eval()
+            _pred.eval()
+            with torch.no_grad():
+                for vis_idx, vis_sample in enumerate(pca_loader):
+                    if vis_idx >= n_pca_scenes:
+                        break
+                    v_imgs  = vis_sample["images"].to(device)
+                    v_states     = vis_sample["states"].to(device, dtype=torch.float)[:, ::tubelet_size]
+                    v_actions    = vis_sample["actions"].to(device, dtype=torch.float)[:, ::tubelet_size]
+                    v_intrinsics = vis_sample["intrinsics"].to(device, dtype=torch.float)[:, ::tubelet_size]
+                    full_clip = v_imgs.permute(0, 2, 1, 3, 4)
+                    layer_outs = _enc(full_clip)
+                    if normalize_reps:
+                        layer_outs = [F.layer_norm(f, (f.size(-1),)) for f in layer_outs]
+                    h_tgt = torch.cat(layer_outs, dim=-1)[0]   # [T*HW, L*D]
+                    ctx_clip = v_imgs[:, :ctx_frames_eval].permute(0, 2, 1, 3, 4)
+                    ctx_lo = _enc(ctx_clip)
+                    if normalize_reps:
+                        ctx_lo = [F.layer_norm(f, (f.size(-1),)) for f in ctx_lo]
+                    h_ctx = torch.cat(ctx_lo, dim=-1)           # [B, n_ctx*HW, L*D]
+                    B_v, N_ctx_v, D_v = h_ctx.shape
+                    pad_v = torch.zeros(B_v, T_tok * HW - N_ctx_v, D_v, device=device, dtype=h_ctx.dtype)
+                    h_in  = torch.cat([h_ctx, pad_v], dim=1)
+                    preds_v, _ = _pred(
+                        h_in, v_actions, v_states,
+                        intrinsics=v_intrinsics if use_intrinsics else None,
+                    )
+                    h_pred_v = preds_v[0]                       # [T*HW, L*D]
+                    out_path = os.path.join(pca_vis_dir, f"e{epoch:03d}_scene{vis_idx:02d}.png")
+                    try:
+                        visualize_pca_features(
+                            h_gt=h_tgt, h_pred=h_pred_v,
+                            imgs=v_imgs[0], grid_h=grid_h, grid_w=grid_w,
+                            out_path=out_path, n_frames=4,
+                        )
+                    except Exception as _ve:
+                        logger.warning(f"PCA vis failed for scene {vis_idx}: {_ve}")
+            _enc.train()
+            _pred.train()
+            logger.info(f"PCA visualisations saved to {pca_vis_dir}")
