@@ -62,6 +62,10 @@ def _init_re10k_loader(
     persistent_workers,
     world_size,
     rank,
+    manifest_cache_dir=None,
+    fixed_manifest_path=None,
+    local_chunk_cache_dir=None,
+    local_chunk_cache_limit_gb=0.0,
 ):
     """Build RE10K train DataLoader using RE10KLazySceneDataset + RE10KSequenceDataset."""
     # Import here so the module can be used without GWM on sys.path when running
@@ -81,6 +85,10 @@ def _init_re10k_loader(
         root=data_root,
         stage="train",
         image_size=image_size,
+        manifest_cache_dir=manifest_cache_dir,
+        fixed_manifest_path=fixed_manifest_path,
+        local_chunk_cache_dir=local_chunk_cache_dir,
+        local_chunk_cache_limit_gb=local_chunk_cache_limit_gb,
     )
     dataset = RE10KSequenceDataset(
         lazy_dataset=lazy_ds,
@@ -187,6 +195,11 @@ def main(args, resume_preempt=False):
     # Number of context tubelets shown to the context encoder.
     # The predictor must hallucinate the remaining (T_tok - n_ctx_tubelets) tubelets.
     n_ctx_tubelets = cfgs_data.get("n_ctx_tubelets", 1)
+    # Manifest / cache paths (forwarded to RE10KLazySceneDataset)
+    manifest_cache_dir = cfgs_data.get("manifest_cache_dir", None)
+    fixed_manifest_path = cfgs_data.get("fixed_manifest_path", None)
+    local_chunk_cache_dir = cfgs_data.get("local_chunk_cache_dir", None)
+    local_chunk_cache_limit_gb = float(cfgs_data.get("local_chunk_cache_limit_gb", 0.0))
 
     # -- LOSS
     cfgs_loss = args.get("loss")
@@ -295,6 +308,10 @@ def main(args, resume_preempt=False):
         persistent_workers=persistent_workers,
         world_size=world_size,
         rank=rank,
+        manifest_cache_dir=manifest_cache_dir,
+        fixed_manifest_path=fixed_manifest_path,
+        local_chunk_cache_dir=local_chunk_cache_dir,
+        local_chunk_cache_limit_gb=local_chunk_cache_limit_gb,
     )
     _dlen = len(unsupervised_loader)
     if ipe is None:
