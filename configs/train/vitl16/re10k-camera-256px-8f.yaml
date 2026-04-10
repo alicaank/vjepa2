@@ -1,15 +1,13 @@
 app: vjepa_camera_re10k
 cpus_per_task: 8
-folder: /your_folder/re10k/camera-vitl16-256px-8f
+folder: /your_folder/re10k/camera-vitl16-384px-8f
 mem_per_gpu: 80G
 nodes: 2
 tasks_per_node: 8
 data:
-  # Path to the RE10K root directory containing train/ and test/ subdirs
-  # with preprocessed .torch chunk files (produced by the GWM pipeline).
-  data_root: /your_re10k_root
-  batch_size: 8
-  crop_size: 256
+  data_root: /home/ak/GWM/dataset/re10k
+  batch_size: 4
+  crop_size: 384
   patch_size: 16
   tubelet_size: 2
   seq_len: 8          # temporal frames per clip
@@ -26,8 +24,9 @@ meta:
   resume_checkpoint: null
   load_predictor: false
   load_encoder: true
-  # Point to a pretrained V-JEPA2 ViT-L checkpoint
-  pretrain_checkpoint: /your_vjepa2_checkpoints/vitl.pt
+  # V-JEPA2 ViT-L pretrained weights loaded via HuggingFace Hub.
+  # Format: hf://<org>/<repo>/<filename>
+  pretrain_checkpoint: hf://facebook/vjepa2/vitl.pt
   context_encoder_key: target_encoder
   target_encoder_key: target_encoder
   save_every_freq: 25

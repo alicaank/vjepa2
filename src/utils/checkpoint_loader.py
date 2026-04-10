@@ -15,11 +15,43 @@ from src.utils.logging import get_logger
 
 logger = get_logger(os.path.basename(__file__))
 
+_HF_PREFIX = "hf://"
+
+
+def _resolve_hf_path(r_path: str) -> str:
+    """Resolve an hf://<repo_id>/<filename> path to a local cache path.
+
+    Format: hf://<repo_id>/<filename_in_repo>
+    Example: hf://facebook/vjepa2-vitl/vitl.pt
+    """
+    from huggingface_hub import hf_hub_download
+
+    # Strip prefix and split into repo_id / filename
+    remainder = r_path[len(_HF_PREFIX):]
+    # repo_id is first two path components (org/model); rest is filename
+    parts = remainder.split("/")
+    if len(parts) < 3:
+        raise ValueError(
+            f"HuggingFace path must be hf://<org>/<repo>/<filename>, got: {r_path}"
+        )
+    repo_id = "/".join(parts[:2])
+    filename = "/".join(parts[2:])
+    logger.info(f"Downloading from HuggingFace: repo={repo_id}  file={filename}")
+    local_path = hf_hub_download(repo_id=repo_id, filename=filename)
+    logger.info(f"Downloaded to: {local_path}")
+    return local_path
+
 
 def robust_checkpoint_loader(r_path: str, map_location: MAP_LOCATION = "cpu", max_retries: int = 3) -> Any:
     """
-    Loads a checkpoint from a path, retrying up to max_retries times if the checkpoint is not found.
+    Loads a checkpoint from a local path or a HuggingFace Hub path.
+
+    HuggingFace paths use the format:  hf://<org>/<repo>/<filename>
+    e.g.  hf://facebook/vjepa2-vitl/vitl.pt
     """
+    if r_path.startswith(_HF_PREFIX):
+        r_path = _resolve_hf_path(r_path)
+
     retries = 0
 
     while retries < max_retries:
