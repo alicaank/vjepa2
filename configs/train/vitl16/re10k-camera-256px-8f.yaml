@@ -1,0 +1,71 @@
+app: vjepa_camera_re10k
+cpus_per_task: 8
+folder: /your_folder/re10k/camera-vitl16-256px-8f
+mem_per_gpu: 80G
+nodes: 2
+tasks_per_node: 8
+data:
+  # Path to the RE10K root directory containing train/ and test/ subdirs
+  # with preprocessed .torch chunk files (produced by the GWM pipeline).
+  data_root: /your_re10k_root
+  batch_size: 8
+  crop_size: 256
+  patch_size: 16
+  tubelet_size: 2
+  seq_len: 8          # temporal frames per clip
+  stride: 4           # temporal stride between sampled frames
+  min_stride: 1       # fallback stride for short clips
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: true
+loss:
+  loss_exp: 1.0
+  normalize_reps: true
+meta:
+  dtype: bfloat16
+  resume_checkpoint: null
+  load_predictor: false
+  load_encoder: true
+  # Point to a pretrained V-JEPA2 ViT-L checkpoint
+  pretrain_checkpoint: /your_vjepa2_checkpoints/vitl.pt
+  context_encoder_key: target_encoder
+  target_encoder_key: target_encoder
+  save_every_freq: 25
+  seed: 42
+  use_sdpa: true
+  sync_gc: false
+model:
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 1024
+  pred_num_heads: 16
+  pred_is_frame_causal: true
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_rope: true
+  use_silu: false
+  use_pred_silu: false
+  wide_silu: true
+  # V-JEPA 2.1 hierarchical features
+  n_hierarchical_layers: 4   # encoder layers whose outputs are concatenated
+  # Camera conditioning
+  state_dim: 7        # 3D translation + 4D quaternion
+  action_dim: 7       # relative SE(3) delta (translation + quaternion)
+  intrinsics_dim: 4   # normalised [fx/W, fy/H, cx/W, cy/H]
+  use_intrinsics: true
+  predict_all: true   # dense predictive loss on context tokens
+optimization:
+  anneal: 15
+  epochs: 100
+  final_lr: 0.0
+  final_weight_decay: 0.04
+  ipe: 500
+  lr: 0.0003
+  start_lr: 0.00005
+  warmup: 10
+  weight_decay: 0.04
+  enc_lr_scale: 0.1   # encoder LR is 10x lower (mostly frozen)
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-8
