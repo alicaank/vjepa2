@@ -35,7 +35,7 @@ from torch.utils.data.distributed import DistributedSampler
 from app.vjepa_camera_re10k.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
-from src.training.visualization import visualize_pca_features
+from src.training.visualization import visualize_pca_features, plot_training_curves
 
 log_timings = True
 log_freq = 10
@@ -451,6 +451,10 @@ def main(args, resume_preempt=False):
         gc.disable()
         gc.collect()
 
+    # Per-epoch stats accumulator for training curves
+    training_stats = {"loss": [], "loss_pred": [], "loss_ctx": [], "lr": [], "wd": [],
+                      "iter_ms": [], "gpu_ms": [], "mem_gb": []}
+
     # ------------------------------------------------------------------ #
     # TRAINING LOOP
     # ------------------------------------------------------------------ #
@@ -656,11 +660,34 @@ def main(args, resume_preempt=False):
             assert not np.isnan(loss), "loss is nan"
 
         logger.info("avg. loss %.3f" % loss_meter.avg)
+
+        # -- accumulate epoch-level stats for curves
+        training_stats["loss"].append(loss_meter.avg)
+        training_stats["loss_pred"].append(loss_pred_meter.avg)
+        training_stats["loss_ctx"].append(loss_ctx_meter.avg)
+        training_stats["lr"].append(scheduler.get_last_lr() if hasattr(scheduler, "get_last_lr") else _new_lr)
+        training_stats["wd"].append(_new_wd)
+        training_stats["iter_ms"].append(iter_time_meter.avg)
+        training_stats["gpu_ms"].append(gpu_time_meter.avg)
+        training_stats["mem_gb"].append(torch.cuda.max_memory_allocated() / 1024.0**3)
+
         if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
             if save_every_freq > 0 and epoch % save_every_freq == 0:
                 save_every_path = os.path.join(folder, f"e{epoch}.pt")
                 save_checkpoint(epoch + 1, save_every_path)
+
+                # -- training curves
+                if rank == 0:
+                    from pathlib import Path
+                    try:
+                        plot_training_curves(
+                            training_stats,
+                            Path(folder) / f"training_curves_e{epoch:03d}.png",
+                        )
+                        logger.info(f"Training curves saved to {folder}/training_curves_e{epoch:03d}.png")
+                    except Exception as _ce:
+                        logger.warning(f"Training curves failed: {_ce}")
 
         # -- PCA feature visualisation on test scenes
         if pca_loader is not None and (save_every_freq > 0 and epoch % save_every_freq == 0):
