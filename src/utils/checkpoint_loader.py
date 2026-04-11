@@ -55,8 +55,13 @@ def robust_checkpoint_loader(r_path: str, map_location: MAP_LOCATION = "cpu", ma
     if r_path.startswith(_HF_PREFIX):
         r_path = _resolve_hf_path(r_path)
     elif r_path.startswith(_HTTPS_PREFIX) or r_path.startswith(_HTTP_PREFIX):
-        logger.info(f"Downloading checkpoint from URL: {r_path}")
-        return torch.hub.load_state_dict_from_url(r_path, map_location=map_location)
+        model_dir = os.path.join(
+            os.environ.get("TORCH_HOME", os.path.expanduser("~/.cache/torch")),
+            "hub", "checkpoints",
+        )
+        os.makedirs(model_dir, exist_ok=True)
+        logger.info(f"Downloading checkpoint from URL: {r_path} -> {model_dir}")
+        return torch.hub.load_state_dict_from_url(r_path, map_location=map_location, model_dir=model_dir)
 
     retries = 0
 
