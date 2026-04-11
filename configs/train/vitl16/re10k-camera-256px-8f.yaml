@@ -29,7 +29,7 @@ meta:
   pretrain_checkpoint: https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt
   context_encoder_key: ema_encoder
   target_encoder_key: ema_encoder
-  save_every_freq: 25
+  save_every_freq: 1000
   seed: 42
   use_sdpa: true
   sync_gc: false

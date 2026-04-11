@@ -38,8 +38,9 @@ from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from src.training.visualization import visualize_pca_features, plot_training_curves
 
 log_timings = True
-log_freq = 10
-CHECKPOINT_FREQ = 1
+log_freq = 100
+CHECKPOINT_FREQ = 1000
+VIZ_FREQ = 500
 GARBAGE_COLLECT_ITR_FREQ = 50
 
 _GLOBAL_SEED = 0
@@ -702,7 +703,7 @@ def main(args, resume_preempt=False):
                         logger.warning(f"Training curves failed: {_ce}")
 
         # -- PCA feature visualisation on test scenes
-        if pca_loader is not None and (save_every_freq > 0 and epoch % save_every_freq == 0):
+        if pca_loader is not None and (epoch % VIZ_FREQ == 0 or epoch == (num_epochs - 1)):
             logger.info("Running PCA feature visualisation...")
             grid_h = grid_w = crop_size // patch_size
             HW = grid_h * grid_w
