@@ -135,6 +135,7 @@ def main(args, resume_preempt=False):
 
     # -- META
     folder = args.get("folder")
+    scratch_folder = args.get("scratch_folder") or folder
     cfgs_meta = args.get("meta")
     r_file = cfgs_meta.get("resume_checkpoint", None)
     p_file = cfgs_meta.get("pretrain_checkpoint", None)
@@ -243,9 +244,10 @@ def main(args, resume_preempt=False):
         device = torch.device("cuda:0")
         torch.cuda.set_device(device)
 
+    os.makedirs(scratch_folder, exist_ok=True)
     log_file = os.path.join(folder, f"log_r{rank}.csv")
-    latest_path = os.path.join(folder, "latest.pt")
-    resume_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+    latest_path = os.path.join(scratch_folder, "latest.pt")
+    resume_path = os.path.join(scratch_folder, r_file) if r_file is not None else latest_path
     if not os.path.exists(resume_path):
         resume_path = None
 
@@ -680,8 +682,12 @@ def main(args, resume_preempt=False):
         if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
             if save_every_freq > 0 and epoch % save_every_freq == 0:
-                save_every_path = os.path.join(folder, f"e{epoch}.pt")
+                save_every_path = os.path.join(scratch_folder, f"e{epoch}.pt")
                 save_checkpoint(epoch + 1, save_every_path)
+                prev_save = os.path.join(scratch_folder, f"e{epoch - save_every_freq}.pt")
+                if rank == 0 and os.path.exists(prev_save):
+                    os.remove(prev_save)
+                    logger.info(f"Removed old checkpoint: {prev_save}")
 
                 # -- training curves
                 if rank == 0:
