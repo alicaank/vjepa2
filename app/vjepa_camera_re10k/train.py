@@ -725,6 +725,8 @@ def main(args, resume_preempt=False):
                     if normalize_reps:
                         layer_outs = [F.layer_norm(f, (f.size(-1),)) for f in layer_outs]
                     h_tgt = torch.cat(layer_outs, dim=-1)[0]   # [T*HW, L*D]
+                    _layer_D = layer_outs[-1].shape[-1]
+                    h_tgt_last = h_tgt[..., -_layer_D:]        # [T*HW, D] last layer only
                     ctx_clip = v_imgs[:, :ctx_frames_eval].permute(0, 2, 1, 3, 4)
                     ctx_lo = _enc(ctx_clip)
                     if normalize_reps:
@@ -737,11 +739,11 @@ def main(args, resume_preempt=False):
                         h_in, v_actions, v_states,
                         intrinsics=v_intrinsics if use_intrinsics else None,
                     )
-                    h_pred_v = preds_v[0]                       # [T*HW, L*D]
+                    h_pred_last = preds_v[0][..., -_layer_D:]  # [T*HW, D] last layer only
                     out_path = os.path.join(pca_vis_dir, f"e{epoch:03d}_scene{vis_idx:02d}.png")
                     try:
                         visualize_pca_features(
-                            h_gt=h_tgt, h_pred=h_pred_v,
+                            h_gt=h_tgt_last, h_pred=h_pred_last,
                             imgs=v_imgs[0], grid_h=grid_h, grid_w=grid_w,
                             out_path=out_path, n_frames=4,
                         )
