@@ -430,14 +430,21 @@ def main(args, resume_preempt=False):
             "world_size": world_size,
             "lr": lr,
         }
-        tmp_path = path + ".tmp"
+        # Stage to local /tmp first — blob FUSE mounts don't support torch.save's
+        # internal seek-based write protocol, causing inline_container.cc corruption.
+        import tempfile, shutil
         try:
+            with tempfile.NamedTemporaryFile(dir='/tmp', suffix='.pt', delete=False) as tf:
+                tmp_path = tf.name
             torch.save(save_dict, tmp_path)
-            os.replace(tmp_path, path)
+            shutil.copy2(tmp_path, path)
+            os.remove(tmp_path)
         except Exception as e:
             logger.info(f"Encountered exception when saving checkpoint: {e}")
-            if os.path.exists(tmp_path):
+            try:
                 os.remove(tmp_path)
+            except Exception:
+                pass
 
     logger.info("Initializing loader...")
     unsupervised_sampler.set_epoch(start_epoch)
@@ -723,16 +730,12 @@ def main(args, resume_preempt=False):
                     v_intrinsics = vis_sample["intrinsics"].to(device, dtype=torch.float)[:, ::tubelet_size]
                     full_clip = v_imgs.permute(0, 2, 1, 3, 4)
                     layer_outs = _enc(full_clip)
-                    if normalize_reps:
-                        layer_outs = [F.layer_norm(f, (f.size(-1),)) for f in layer_outs]
-                    h_tgt = torch.cat(layer_outs, dim=-1)[0]   # [T*HW, L*D]
+                    h_tgt = torch.cat(layer_outs, dim=-1)[0]   # [T*HW, L*D] raw, no layer_norm for PCA
                     _layer_D = layer_outs[-1].shape[-1]
                     h_tgt_last = h_tgt[..., -_layer_D:]        # [T*HW, D] last layer only
                     ctx_clip = v_imgs[:, :ctx_frames_eval].permute(0, 2, 1, 3, 4)
                     ctx_lo = _enc(ctx_clip)
-                    if normalize_reps:
-                        ctx_lo = [F.layer_norm(f, (f.size(-1),)) for f in ctx_lo]
-                    h_ctx = torch.cat(ctx_lo, dim=-1)           # [B, n_ctx*HW, L*D]
+                    h_ctx = torch.cat(ctx_lo, dim=-1)           # [B, n_ctx*HW, L*D] raw
                     B_v, N_ctx_v, D_v = h_ctx.shape
                     pad_v = torch.zeros(B_v, T_tok * HW - N_ctx_v, D_v, device=device, dtype=h_ctx.dtype)
                     h_in  = torch.cat([h_ctx, pad_v], dim=1)
