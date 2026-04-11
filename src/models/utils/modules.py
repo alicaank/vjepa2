@@ -246,7 +246,7 @@ class ACRoPEAttention(nn.Module):
             v = merge_(v, action_v)
 
         if attn_mask is not None or self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION, torch.nn.attention.SDPBackend.MATH]):
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal, attn_mask=attn_mask
                 )
@@ -370,7 +370,7 @@ class RoPEAttention(nn.Module):
             k = torch.cat([kd, kh, kw], dim=-1)
 
         if attn_mask is not None or self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION, torch.nn.attention.SDPBackend.MATH]):
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal, attn_mask=attn_mask
                 )
@@ -417,7 +417,7 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
 
         if attn_mask is not None or self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION, torch.nn.attention.SDPBackend.MATH]):
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal, attn_mask=attn_mask
                 )
@@ -588,7 +588,7 @@ class CrossAttention(nn.Module):
         k, v = kv[0], kv[1]  # (batch_size, num_heads, seq_len, feature_dim_per_head)
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION, torch.nn.attention.SDPBackend.MATH]):
                 q = F.scaled_dot_product_attention(q, k, v)
         else:
             xattn = (q @ k.transpose(-2, -1)) * self.scale
