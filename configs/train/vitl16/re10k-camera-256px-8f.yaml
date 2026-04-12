@@ -55,10 +55,10 @@ model:
   predict_all: true   # dense predictive loss on context tokens
 optimization:
   anneal: 15
-  epochs: 100
+  epochs: 50
   final_lr: 0.0
   final_weight_decay: 0.04
-  ipe: 500
+  ipe: 100
   lr: 0.0003
   start_lr: 0.00005
   warmup: 10
