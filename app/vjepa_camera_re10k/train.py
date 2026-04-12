@@ -687,7 +687,7 @@ def main(args, resume_preempt=False):
         training_stats["gpu_ms"].append(gpu_time_meter.avg)
         training_stats["mem_gb"].append(torch.cuda.max_memory_allocated() / 1024.0**3)
 
-        if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
+        if epoch > 0 and (epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1)):
             save_checkpoint(epoch + 1, latest_path)
             if save_every_freq > 0 and epoch % save_every_freq == 0:
                 save_every_path = os.path.join(scratch_folder, f"e{epoch}.pt")
@@ -710,7 +710,7 @@ def main(args, resume_preempt=False):
                         logger.warning(f"Training curves failed: {_ce}")
 
         # -- PCA feature visualisation on test scenes
-        if pca_loader is not None and (epoch % VIZ_FREQ == 0 or epoch == (num_epochs - 1)):
+        if pca_loader is not None and (epoch > 0 and (epoch % VIZ_FREQ == 0 or epoch == (num_epochs - 1))):
             logger.info("Running PCA feature visualisation...")
             grid_h = grid_w = crop_size // patch_size
             HW = grid_h * grid_w
