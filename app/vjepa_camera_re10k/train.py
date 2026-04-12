@@ -39,8 +39,8 @@ from src.training.visualization import visualize_pca_features, plot_training_cur
 
 log_timings = True
 log_freq = 100
-CHECKPOINT_FREQ = 1000
-VIZ_FREQ = 500
+CHECKPOINT_FREQ = 50
+VIZ_FREQ = 50
 GARBAGE_COLLECT_ITR_FREQ = 50
 
 _GLOBAL_SEED = 0
