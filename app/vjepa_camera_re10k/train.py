@@ -430,11 +430,14 @@ def main(args, resume_preempt=False):
             "world_size": world_size,
             "lr": lr,
         }
-        # Stage to local /tmp first — blob FUSE mounts don't support torch.save's
+        # Stage to scratch disk first — blob FUSE mounts don't support torch.save's
         # internal seek-based write protocol, causing inline_container.cc corruption.
+        # Use /mnt/resource (separate scratch disk) if available; /tmp is on root FS
+        # on largecomputeff and will cause ENOSPC for a 5GB checkpoint.
         import tempfile, shutil
+        _stage_dir = '/mnt/resource' if os.path.isdir('/mnt/resource') else '/tmp'
         try:
-            with tempfile.NamedTemporaryFile(dir='/tmp', suffix='.pt', delete=False) as tf:
+            with tempfile.NamedTemporaryFile(dir=_stage_dir, suffix='.pt', delete=False) as tf:
                 tmp_path = tf.name
             torch.save(save_dict, tmp_path)
             shutil.copy2(tmp_path, path)
