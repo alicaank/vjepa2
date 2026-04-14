@@ -17,6 +17,43 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
 
+def _upgrade_camera_predictor_state_dict(pretrained_dict, model):
+    model_keys = set(model.state_dict().keys())
+
+    def _upgrade_projection(prefix):
+        old_weight_key = f"{prefix}.weight"
+        old_bias_key = f"{prefix}.bias"
+        first_head_weight_key = f"{prefix}.0.weight"
+        first_head_bias_key = f"{prefix}.0.bias"
+        if first_head_weight_key not in model_keys or old_weight_key not in pretrained_dict:
+            return
+        head_weight_shape = model.state_dict()[first_head_weight_key].shape
+        old_weight = pretrained_dict.pop(old_weight_key)
+        if old_weight.shape[0] % head_weight_shape[0] != 0:
+            pretrained_dict[old_weight_key] = old_weight
+            return
+        n_heads = old_weight.shape[0] // head_weight_shape[0]
+        for head_idx in range(n_heads):
+            start = head_idx * head_weight_shape[0]
+            end = (head_idx + 1) * head_weight_shape[0]
+            pretrained_dict[f"{prefix}.{head_idx}.weight"] = old_weight[start:end]
+        if old_bias_key in pretrained_dict and first_head_bias_key in model_keys:
+            old_bias = pretrained_dict.pop(old_bias_key)
+            head_bias_shape = model.state_dict()[first_head_bias_key].shape
+            if old_bias.shape[0] % head_bias_shape[0] != 0:
+                pretrained_dict[old_bias_key] = old_bias
+                return
+            n_bias_heads = old_bias.shape[0] // head_bias_shape[0]
+            for head_idx in range(n_bias_heads):
+                start = head_idx * head_bias_shape[0]
+                end = (head_idx + 1) * head_bias_shape[0]
+                pretrained_dict[f"{prefix}.{head_idx}.bias"] = old_bias[start:end]
+
+    for prefix in ("predictor_proj", "module.predictor_proj", "predictor_proj_context", "module.predictor_proj_context"):
+        _upgrade_projection(prefix)
+    return pretrained_dict
+
+
 def load_pretrained(
     r_path,
     encoder=None,
@@ -40,6 +77,7 @@ def load_pretrained(
     if load_predictor:
         pretrained_dict = checkpoint["predictor"]
         pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        pretrained_dict = _upgrade_camera_predictor_state_dict(pretrained_dict, predictor)
         msg = predictor.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
 
@@ -65,20 +103,38 @@ def load_checkpoint(
     logger.info(f"Loading checkpoint from {r_path}")
     checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
     epoch = checkpoint["epoch"]
+    checkpoint_type = checkpoint.get("checkpoint_type", "full")
+    logger.info(f"checkpoint type: {checkpoint_type}")
+
+    if "target_encoder" not in checkpoint and "encoder" in checkpoint:
+        checkpoint["target_encoder"] = checkpoint["encoder"]
 
     for key, model in [("encoder", encoder), ("predictor", predictor), ("target_encoder", target_encoder)]:
         if model is None:
             continue
+        if key not in checkpoint:
+            logger.warning(f"Checkpoint is missing {key}; skipping load for that module.")
+            continue
         pretrained_dict = checkpoint[key]
         for kw in replace_kw:
             pretrained_dict = {k.replace(kw, ""): v for k, v in pretrained_dict.items()}
+        if key == "predictor":
+            pretrained_dict = _upgrade_camera_predictor_state_dict(pretrained_dict, model)
         msg = model.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded {key} from epoch {epoch} with msg: {msg}")
 
     if opt is not None:
-        opt.load_state_dict(checkpoint["opt"])
+        opt_state = checkpoint.get("opt")
+        if opt_state is not None:
+            opt.load_state_dict(opt_state)
+        else:
+            logger.warning("Checkpoint has no optimizer state; resuming from weights-only checkpoint.")
     if scaler is not None:
-        scaler.load_state_dict(checkpoint["scaler"])
+        scaler_state = checkpoint.get("scaler")
+        if scaler_state is not None:
+            scaler.load_state_dict(scaler_state)
+        else:
+            logger.warning("Checkpoint has no scaler state; resuming from weights-only checkpoint.")
 
     logger.info(f"read-path: {r_path}")
     del checkpoint

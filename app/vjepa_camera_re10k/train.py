@@ -11,21 +11,20 @@
 #   3. Call target_encoder with training_mode=True for multi-layer features
 #   4. Compute V-JEPA 2.1 hierarchical dense predictive loss
 
+import json
 import os
-
-try:
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
-except Exception:
-    pass
-
+import glob
 import copy
 import gc
 import random
+import shutil
 import sys
+import tempfile
 import time
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
@@ -42,6 +41,7 @@ log_freq = 100
 CHECKPOINT_FREQ = 10
 VIZ_FREQ = 10
 GARBAGE_COLLECT_ITR_FREQ = 50
+MIN_FREE_BYTES_FOR_FULL_CHECKPOINT = 6 * 1024**3
 
 _GLOBAL_SEED = 0
 random.seed(_GLOBAL_SEED)
@@ -52,11 +52,49 @@ torch.backends.cudnn.benchmark = True
 logger = get_logger(__name__, force=True)
 
 
+def _quat_conjugate(quat):
+    return torch.cat([-quat[..., :3], quat[..., 3:4]], dim=-1)
+
+
+def _quat_multiply(quat_a, quat_b):
+    ax, ay, az, aw = quat_a.unbind(dim=-1)
+    bx, by, bz, bw = quat_b.unbind(dim=-1)
+    return torch.stack(
+        (
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ),
+        dim=-1,
+    )
+
+
+def _quat_rotate(quat, vec):
+    quat_xyz = quat[..., :3]
+    quat_w = quat[..., 3:4]
+    cross_term = 2.0 * torch.cross(quat_xyz, vec, dim=-1)
+    return vec + quat_w * cross_term + torch.cross(quat_xyz, cross_term, dim=-1)
+
+
+def _canonicalize_states(states):
+    ref_trans = states[:, :1, :3]
+    ref_quat = F.normalize(states[:, :1, 3:], dim=-1, eps=1.0e-6)
+    inv_ref_quat = _quat_conjugate(ref_quat)
+    inv_ref_quat = inv_ref_quat.expand(-1, states.size(1), -1)
+    rel_trans = _quat_rotate(inv_ref_quat, states[:, :, :3] - ref_trans)
+    rel_quat = _quat_multiply(inv_ref_quat, F.normalize(states[:, :, 3:], dim=-1, eps=1.0e-6))
+    rel_quat = F.normalize(rel_quat, dim=-1, eps=1.0e-6)
+    rel_quat = torch.where(rel_quat[..., 3:4] < 0, -rel_quat, rel_quat)
+    return torch.cat([rel_trans, rel_quat], dim=-1)
+
+
 def _init_re10k_loader(
     data_root,
     seq_len,
     stride,
     min_stride,
+    stride_values,
     image_size,
     batch_size,
     num_workers,
@@ -97,6 +135,7 @@ def _init_re10k_loader(
         seq_len=seq_len,
         stride=stride,
         min_stride=min_stride,
+        stride_values=stride_values,
         image_size=image_size,
     )
     sampler = DistributedSampler(
@@ -146,6 +185,9 @@ def main(args, resume_preempt=False):
     load_encoder = cfgs_meta.get("load_encoder", True)
     seed = cfgs_meta.get("seed", _GLOBAL_SEED)
     save_every_freq = cfgs_meta.get("save_every_freq", -1)
+    checkpoint_save_mode = str(
+        cfgs_meta.get("checkpoint_save_mode", os.environ.get("CHECKPOINT_SAVE_MODE", "auto"))
+    ).lower()
     skip_batches = cfgs_meta.get("skip_batches", -1)
     use_sdpa = cfgs_meta.get("use_sdpa", True)
     sync_gc = cfgs_meta.get("sync_gc", False)
@@ -188,8 +230,19 @@ def main(args, resume_preempt=False):
     seq_len = cfgs_data.get("seq_len", 8)
     stride = cfgs_data.get("stride", 4)
     min_stride = cfgs_data.get("min_stride", 1)
+    stride_values = cfgs_data.get("stride_values", None)
+    if stride_values in (None, ""):
+        stride_values = None
+    else:
+        if not isinstance(stride_values, (list, tuple)):
+            raise ValueError("data.stride_values must be a list or tuple of positive integers.")
+        stride_values = [max(1, int(v)) for v in stride_values]
+        if len(stride_values) == 0:
+            stride_values = None
+    stride_candidates = sorted(set(stride_values)) if stride_values is not None else list(range(max(1, int(min_stride)), max(int(stride), int(min_stride)) + 1))
     batch_size = cfgs_data.get("batch_size")
     tubelet_size = cfgs_data.get("tubelet_size", 2)
+    total_tubelets = seq_len // tubelet_size
     crop_size = cfgs_data.get("crop_size", 256)
     patch_size = cfgs_data.get("patch_size", 16)
     pin_mem = cfgs_data.get("pin_mem", True)
@@ -198,6 +251,25 @@ def main(args, resume_preempt=False):
     # Number of context tubelets shown to the context encoder.
     # The predictor must hallucinate the remaining (T_tok - n_ctx_tubelets) tubelets.
     n_ctx_tubelets = cfgs_data.get("n_ctx_tubelets", 1)
+    ar_random_context = bool(cfgs_data.get("ar_random_context", False))
+    min_ctx_tubelets = int(cfgs_data.get("min_ctx_tubelets", 1))
+    max_ctx_tubelets = cfgs_data.get("max_ctx_tubelets", None)
+    if max_ctx_tubelets in (None, ""):
+        max_ctx_tubelets = total_tubelets - 1
+    else:
+        max_ctx_tubelets = int(max_ctx_tubelets)
+    if total_tubelets < 2:
+        raise ValueError(
+            f"Camera autoregressive training requires at least 2 tubelets, got seq_len={seq_len}, tubelet_size={tubelet_size}."
+        )
+    max_valid_ctx_tubelets = total_tubelets - 1
+    n_ctx_tubelets = max(1, min(int(n_ctx_tubelets), max_valid_ctx_tubelets))
+    min_ctx_tubelets = max(1, min(min_ctx_tubelets, max_valid_ctx_tubelets))
+    max_ctx_tubelets = max(1, min(max_ctx_tubelets, max_valid_ctx_tubelets))
+    if min_ctx_tubelets > max_ctx_tubelets:
+        raise ValueError(
+            f"Invalid autoregressive context range: min_ctx_tubelets={min_ctx_tubelets} > max_ctx_tubelets={max_ctx_tubelets}."
+        )
     # Manifest / cache paths (forwarded to RE10KLazySceneDataset)
     manifest_cache_dir = cfgs_data.get("manifest_cache_dir", None)
     fixed_manifest_path = cfgs_data.get("fixed_manifest_path", None)
@@ -205,6 +277,11 @@ def main(args, resume_preempt=False):
     local_chunk_cache_limit_gb = float(cfgs_data.get("local_chunk_cache_limit_gb", 0.0))
     eval_fixed_manifest_path = cfgs_data.get("eval_fixed_manifest_path", None)
     n_pca_scenes = int(cfgs_data.get("n_pca_scenes", 4))
+    n_motion_eval_scenes = int(cfgs_data.get("n_motion_eval_scenes", max(64, n_pca_scenes)))
+    n_fixed_stride_eval_scenes = int(cfgs_data.get("n_fixed_stride_eval_scenes", max(32, min(128, n_motion_eval_scenes))))
+    eval_stride_small = int(cfgs_data.get("eval_stride_small", stride_candidates[0]))
+    eval_stride_medium = int(cfgs_data.get("eval_stride_medium", stride_candidates[len(stride_candidates) // 2]))
+    eval_stride_large = int(cfgs_data.get("eval_stride_large", stride_candidates[-1]))
 
     # -- LOSS
     cfgs_loss = args.get("loss")
@@ -247,10 +324,19 @@ def main(args, resume_preempt=False):
 
     os.makedirs(scratch_folder, exist_ok=True)
     log_file = os.path.join(folder, f"log_r{rank}.csv")
-    latest_path = os.path.join(scratch_folder, "latest.pt")
-    resume_path = os.path.join(scratch_folder, r_file) if r_file is not None else latest_path
-    if not os.path.exists(resume_path):
-        resume_path = None
+    final_path = os.path.join(scratch_folder, "final.pt")
+    checkpoint_stage_dir = os.environ.get("CHECKPOINT_STAGE_DIR")
+    if checkpoint_stage_dir is None:
+        checkpoint_stage_root = "/mnt/resource" if os.path.isdir("/mnt/resource") else os.environ.get("TMPDIR", "/tmp")
+        checkpoint_stage_dir = os.path.join(checkpoint_stage_root, "vjepa_camera_ckpt_stage")
+    os.makedirs(checkpoint_stage_dir, exist_ok=True)
+    if r_file is not None:
+        resume_path = os.path.join(scratch_folder, r_file)
+        if not os.path.exists(resume_path):
+            resume_path = None
+    else:
+        epoch_checkpoints = sorted(glob.glob(os.path.join(scratch_folder, "e*.pt")))
+        resume_path = final_path if os.path.exists(final_path) else (epoch_checkpoints[-1] if epoch_checkpoints else None)
 
     csv_logger = CSVLogger(
         log_file,
@@ -305,6 +391,7 @@ def main(args, resume_preempt=False):
     # -- init eval loader for PCA visualisation (test split, no DDP sampler)
     pca_vis_dir = os.path.join(folder, "pca_vis")
     os.makedirs(pca_vis_dir, exist_ok=True)
+    fixed_stride_eval_loaders = {}
     try:
         gwm_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
         if gwm_root not in sys.path:
@@ -319,18 +406,39 @@ def main(args, resume_preempt=False):
             local_chunk_cache_dir=local_chunk_cache_dir,
             local_chunk_cache_limit_gb=local_chunk_cache_limit_gb,
         )
-        _eval_ds = RE10KSequenceDataset(
-            lazy_dataset=_eval_lazy, seq_len=seq_len, stride=stride,
-            min_stride=min_stride, image_size=crop_size,
+        def _make_eval_loader(eval_stride_override=None):
+            if eval_stride_override is None:
+                eval_stride = stride
+                eval_min_stride = min_stride
+                eval_stride_values = stride_values
+            else:
+                eval_stride = int(eval_stride_override)
+                eval_min_stride = eval_stride
+                eval_stride_values = [eval_stride]
+            _eval_ds = RE10KSequenceDataset(
+                lazy_dataset=_eval_lazy, seq_len=seq_len, stride=eval_stride,
+                min_stride=eval_min_stride, stride_values=eval_stride_values, image_size=crop_size,
+            )
+            _loader = DataLoader(
+                _eval_ds, batch_size=1, shuffle=False,
+                num_workers=0, pin_memory=False,
+                collate_fn=collate_re10k_sequences, drop_last=False,
+            )
+            return _loader, len(_eval_ds)
+
+        pca_loader, _eval_ds_len = _make_eval_loader()
+        fixed_stride_eval_loaders = {
+            "small": (eval_stride_small, _make_eval_loader(eval_stride_small)[0]),
+            "medium": (eval_stride_medium, _make_eval_loader(eval_stride_medium)[0]),
+            "large": (eval_stride_large, _make_eval_loader(eval_stride_large)[0]),
+        }
+        logger.info(f"PCA eval loader: {_eval_ds_len} test scenes")
+        logger.info(
+            f"Fixed stride eval loaders: small={eval_stride_small}, medium={eval_stride_medium}, large={eval_stride_large}"
         )
-        pca_loader = DataLoader(
-            _eval_ds, batch_size=1, shuffle=False,
-            num_workers=2, pin_memory=False,
-            collate_fn=collate_re10k_sequences, drop_last=False,
-        )
-        logger.info(f"PCA eval loader: {len(_eval_ds)} test scenes")
     except Exception as _e:
         pca_loader = None
+        fixed_stride_eval_loaders = {}
         logger.warning(f"PCA eval loader unavailable: {_e}")
 
     unsupervised_loader, unsupervised_sampler = _init_re10k_loader(
@@ -338,6 +446,7 @@ def main(args, resume_preempt=False):
         seq_len=seq_len,
         stride=stride,
         min_stride=min_stride,
+        stride_values=stride_values,
         image_size=crop_size,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -374,9 +483,20 @@ def main(args, resume_preempt=False):
         eps=eps,
     )
 
-    encoder = DistributedDataParallel(encoder, static_graph=True)
-    predictor = DistributedDataParallel(predictor, static_graph=True)
-    target_encoder = DistributedDataParallel(target_encoder)
+    use_ddp = world_size > 1 and dist.is_available() and dist.is_initialized()
+    if use_ddp:
+        encoder = DistributedDataParallel(encoder, static_graph=True)
+        predictor = DistributedDataParallel(predictor, static_graph=True)
+        target_encoder = DistributedDataParallel(target_encoder)
+        logger.info("Wrapped encoder/predictor/target_encoder with DistributedDataParallel.")
+    else:
+        if world_size > 1:
+            logger.warning(
+                "world_size=%s but torch.distributed is not initialized; proceeding without DDP.",
+                world_size,
+            )
+        else:
+            logger.info("Running single-process training without DistributedDataParallel.")
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -391,6 +511,146 @@ def main(args, resume_preempt=False):
         load_predictor=load_predictor,
         load_encoder=load_encoder,
     )
+
+    def _remove_file(path):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to remove {path}: {e}")
+
+    def _remove_tree(path):
+        if not path:
+            return
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
+        except NotADirectoryError:
+            _remove_file(path)
+        except Exception as e:
+            logger.warning(f"Failed to remove tree {path}: {e}")
+
+    def _remove_matching(pattern):
+        for matched_path in glob.glob(pattern):
+            _remove_file(matched_path)
+
+    def _remove_matching_except(pattern, keep_paths):
+        keep_paths = {os.path.abspath(path) for path in keep_paths if path is not None}
+        for matched_path in glob.glob(pattern):
+            if os.path.abspath(matched_path) not in keep_paths:
+                _remove_file(matched_path)
+
+    def _purge_staged_checkpoints():
+        _remove_matching(os.path.join(checkpoint_stage_dir, "vjepa_camera_ckpt_*.pt"))
+
+    def _prune_checkpoint_outputs(keep_path):
+        _remove_matching_except(os.path.join(scratch_folder, "e*.pt"), {keep_path})
+        _remove_matching_except(os.path.join(scratch_folder, "final.pt"), {keep_path})
+
+    def _prune_training_curve_outputs(keep_path):
+        _remove_matching_except(os.path.join(folder, "training_curves_e*.png"), {keep_path})
+
+    def _prune_eval_summary_outputs(keep_path):
+        _remove_matching_except(os.path.join(folder, "eval_summary_e*.json"), {keep_path})
+
+    def _prune_pca_outputs(epoch):
+        keep_pattern = os.path.join(pca_vis_dir, f"e{epoch:03d}_scene*.png")
+        keep_paths = set(glob.glob(keep_pattern))
+        if keep_paths:
+            _remove_matching_except(os.path.join(pca_vis_dir, "e*_scene*.png"), keep_paths)
+
+    def _free_bytes(path):
+        target_path = path if os.path.exists(path) else (os.path.dirname(path) or ".")
+        return shutil.disk_usage(target_path).free
+
+    def _compact_state_dict(state_dict):
+        compact_state = {}
+        for key, value in state_dict.items():
+            if torch.is_tensor(value):
+                value = value.detach().cpu()
+                if torch.is_floating_point(value):
+                    value = value.to(torch.bfloat16)
+            compact_state[key] = value
+        return compact_state
+
+    def _purge_runtime_caches():
+        _purge_staged_checkpoints()
+        pip_cache_dir = os.environ.get("PIP_CACHE_DIR")
+        if pip_cache_dir:
+            _remove_tree(pip_cache_dir)
+            os.makedirs(pip_cache_dir, exist_ok=True)
+        pretrained_cache_path = None
+        if isinstance(p_file, str) and p_file:
+            if os.path.isfile(p_file):
+                pretrained_cache_path = p_file
+            elif p_file.startswith(("https://", "http://")):
+                torch_home = os.environ.get("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
+                pretrained_cache_path = os.path.join(torch_home, "hub", "checkpoints", os.path.basename(p_file))
+        if pretrained_cache_path is not None:
+            resume_abs = os.path.abspath(resume_path) if resume_path is not None else None
+            if resume_abs is None or os.path.abspath(pretrained_cache_path) != resume_abs:
+                _remove_file(pretrained_cache_path)
+
+    def _build_full_checkpoint_payload(epoch):
+        return {
+            "encoder": encoder.state_dict(),
+            "predictor": predictor.state_dict(),
+            "opt": optimizer.state_dict(),
+            "scaler": None if scaler is None else scaler.state_dict(),
+            "target_encoder": target_encoder.state_dict(),
+            "epoch": epoch,
+            "loss": loss_meter.avg,
+            "batch_size": batch_size,
+            "world_size": world_size,
+            "lr": lr,
+            "checkpoint_type": "full",
+        }
+
+    def _build_weights_only_payload(epoch, *, include_target_encoder):
+        payload = {
+            "encoder": _compact_state_dict(encoder.state_dict()),
+            "predictor": _compact_state_dict(predictor.state_dict()),
+            "epoch": epoch,
+            "loss": loss_meter.avg,
+            "batch_size": batch_size,
+            "world_size": world_size,
+            "lr": lr,
+            "checkpoint_type": "weights_only_bf16",
+        }
+        if include_target_encoder:
+            payload["target_encoder"] = _compact_state_dict(target_encoder.state_dict())
+        return payload
+
+    def _write_checkpoint_payload(payload, path, *, tag):
+        tmp_path = None
+        try:
+            _purge_staged_checkpoints()
+            target_dir = os.path.dirname(path) or "."
+            os.makedirs(target_dir, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=checkpoint_stage_dir,
+                prefix="vjepa_camera_ckpt_",
+                suffix=".pt",
+                delete=False,
+            ) as tf:
+                tmp_path = tf.name
+            torch.save(payload, tmp_path)
+            same_filesystem = os.stat(tmp_path).st_dev == os.stat(target_dir).st_dev
+            if same_filesystem:
+                os.replace(tmp_path, path)
+                tmp_path = None
+            else:
+                shutil.copy2(tmp_path, path)
+            logger.info(f"Saved checkpoint ({tag}): {path}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed checkpoint save ({tag}) to {path}: {e}")
+            return False
+        finally:
+            if tmp_path is not None:
+                _remove_file(tmp_path)
 
     start_epoch = 0
     if resume_path is not None and os.path.exists(resume_path):
@@ -413,41 +673,83 @@ def main(args, resume_preempt=False):
             scheduler.step()
             wd_scheduler.step()
 
+    _purge_runtime_caches()
+
     loss_meter = AverageMeter()
+
+    def _broadcast_bool_from_rank0(flag):
+        if not (dist.is_available() and dist.is_initialized() and world_size > 1):
+            return bool(flag)
+        flag_tensor = torch.tensor([1 if (rank == 0 and flag) else 0], device=device, dtype=torch.int32)
+        dist.broadcast(flag_tensor, src=0)
+        return bool(flag_tensor.item())
+
+    def _safe_dist_barrier():
+        if not (dist.is_available() and dist.is_initialized() and world_size > 1):
+            return
+        try:
+            dist.barrier()
+        except Exception as e:
+            logger.warning(f"Distributed barrier failed: {e}")
+
+    def _shutdown_distributed():
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        if world_size > 1:
+            try:
+                dist.barrier()
+            except Exception as e:
+                logger.warning(f"Final distributed barrier failed: {e}")
+        try:
+            dist.destroy_process_group()
+        except Exception as e:
+            logger.warning(f"destroy_process_group failed: {e}")
 
     def save_checkpoint(epoch, path):
         if rank != 0:
-            return
-        save_dict = {
-            "encoder": encoder.state_dict(),
-            "predictor": predictor.state_dict(),
-            "opt": optimizer.state_dict(),
-            "scaler": None if scaler is None else scaler.state_dict(),
-            "target_encoder": target_encoder.state_dict(),
-            "epoch": epoch,
-            "loss": loss_meter.avg,
-            "batch_size": batch_size,
-            "world_size": world_size,
-            "lr": lr,
-        }
-        # Stage to scratch disk first — blob FUSE mounts don't support torch.save's
-        # internal seek-based write protocol, causing inline_container.cc corruption.
-        # Use /mnt/resource (separate scratch disk) if available; /tmp is on root FS
-        # on largecomputeff and will cause ENOSPC for a 5GB checkpoint.
-        import tempfile, shutil
-        _stage_dir = '/mnt/resource' if os.path.isdir('/mnt/resource') else '/tmp'
-        try:
-            with tempfile.NamedTemporaryFile(dir=_stage_dir, suffix='.pt', delete=False) as tf:
-                tmp_path = tf.name
-            torch.save(save_dict, tmp_path)
-            shutil.copy2(tmp_path, path)
-            os.remove(tmp_path)
-        except Exception as e:
-            logger.info(f"Encountered exception when saving checkpoint: {e}")
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+            return False
+        _purge_runtime_caches()
+        if checkpoint_save_mode == "weights_only_no_target":
+            return _write_checkpoint_payload(
+                _build_weights_only_payload(epoch, include_target_encoder=False),
+                path,
+                tag="weights-only-bf16-no-target",
+            )
+        if checkpoint_save_mode == "weights_only":
+            if _write_checkpoint_payload(
+                _build_weights_only_payload(epoch, include_target_encoder=True),
+                path,
+                tag="weights-only-bf16",
+            ):
+                return True
+            return _write_checkpoint_payload(
+                _build_weights_only_payload(epoch, include_target_encoder=False),
+                path,
+                tag="weights-only-bf16-no-target",
+            )
+        free_bytes = _free_bytes(checkpoint_stage_dir)
+        if checkpoint_save_mode == "full" or free_bytes >= MIN_FREE_BYTES_FOR_FULL_CHECKPOINT:
+            if _write_checkpoint_payload(_build_full_checkpoint_payload(epoch), path, tag="full"):
+                return True
+            logger.warning("Full checkpoint save failed; falling back to weights-only checkpoint.")
+        else:
+            logger.warning(
+                f"Only {free_bytes / 1024.0**3:.2f} GiB free in {checkpoint_stage_dir}; "
+                "saving compact weights-only checkpoint instead of full checkpoint."
+            )
+        if _write_checkpoint_payload(
+            _build_weights_only_payload(epoch, include_target_encoder=True),
+            path,
+            tag="weights-only-bf16",
+        ):
+            return True
+        if _write_checkpoint_payload(
+            _build_weights_only_payload(epoch, include_target_encoder=False),
+            path,
+            tag="weights-only-bf16-no-target",
+        ):
+            return True
+        return False
 
     logger.info("Initializing loader...")
     unsupervised_sampler.set_epoch(start_epoch)
@@ -468,9 +770,245 @@ def main(args, resume_preempt=False):
         gc.disable()
         gc.collect()
 
-    # Per-epoch stats accumulator for training curves
     training_stats = {"loss": [], "loss_pred": [], "loss_ctx": [], "lr": [], "wd": [],
                       "iter_ms": [], "gpu_ms": [], "mem_gb": []}
+
+    def run_checkpoint_evaluation(epoch, previous_epoch=None):
+        if rank != 0:
+            return
+
+        def _layerlist_to_h_eval(layer_outs):
+            if normalize_reps:
+                layer_outs = [
+                    F.layer_norm(feat, (feat.size(-1),))
+                    for feat in layer_outs
+                ]
+            return torch.cat(layer_outs, dim=-1)
+
+        def _sample_latent_loss(preds, h_tgt):
+            embed_dim = h_tgt.shape[-1] // n_hierarchical_layers
+            pred_chunks = preds.split(embed_dim, dim=-1)
+            h_chunks = h_tgt.split(embed_dim, dim=-1)
+            loss_pred = preds.new_zeros(())
+            for p, t in zip(pred_chunks, h_chunks):
+                t = t.detach()
+                if normalize_reps:
+                    p = F.layer_norm(p, (p.size(-1),))
+                    t = F.layer_norm(t, (t.size(-1),))
+                loss_pred = loss_pred + (
+                    torch.mean(torch.abs(p - t) ** loss_exp) / loss_exp
+                )
+            loss_pred = loss_pred / n_hierarchical_layers
+            return float(loss_pred.item())
+
+        def _rotation_degrees_from_quat(rel_quat):
+            rel_quat = F.normalize(rel_quat, dim=-1, eps=1.0e-6)
+            imag_norm = torch.linalg.norm(rel_quat[..., :3], dim=-1)
+            real = rel_quat[..., 3].abs().clamp_min(1.0e-8)
+            angle_rad = 2.0 * torch.atan2(imag_norm, real)
+            return float(torch.rad2deg(angle_rad).item())
+
+        def _summarize_motion_bins(metric_name, values, losses):
+            if len(values) == 0:
+                logger.warning(f"No motion-bin validation samples available for {metric_name}.")
+                return None
+            values_np = np.asarray(values, dtype=np.float32)
+            losses_np = np.asarray(losses, dtype=np.float32)
+            q1, q2 = np.quantile(values_np, [1.0 / 3.0, 2.0 / 3.0])
+            bins = {
+                "low": values_np <= q1,
+                "medium": (values_np > q1) & (values_np <= q2),
+                "high": values_np > q2,
+            }
+            parts = []
+            summary = {
+                "q33": float(q1),
+                "q67": float(q2),
+                "bins": {},
+            }
+            for label, mask in bins.items():
+                count = int(mask.sum())
+                if count > 0:
+                    avg_loss = float(losses_np[mask].mean())
+                    avg_value = float(values_np[mask].mean())
+                    parts.append(f"{label}=loss {avg_loss:.5f} ({metric_name} {avg_value:.5f}, n={count})")
+                    summary["bins"][label] = {
+                        "loss": avg_loss,
+                        "value": avg_value,
+                        "count": count,
+                    }
+                else:
+                    parts.append(f"{label}=loss nan ({metric_name} nan, n=0)")
+                    summary["bins"][label] = {
+                        "loss": None,
+                        "value": None,
+                        "count": 0,
+                    }
+            logger.info(
+                f"Motion-bin eval [{metric_name}] q33={float(q1):.5f} q67={float(q2):.5f} :: "
+                + " | ".join(parts)
+            )
+            return summary
+
+        try:
+            curve_path = os.path.join(folder, f"training_curves_e{epoch:03d}.png")
+            plot_training_curves(
+                training_stats,
+                curve_path,
+            )
+            _prune_training_curve_outputs(curve_path)
+            logger.info(f"Training curves saved to {curve_path}")
+        except Exception as _ce:
+            logger.warning(f"Training curves failed: {_ce}")
+
+        if pca_loader is None:
+            return
+
+        logger.info("Running PCA feature visualisation...")
+        grid_h = grid_w = crop_size // patch_size
+        HW = grid_h * grid_w
+        T_tok = seq_len // tubelet_size
+        k_eval = max(1, min(n_ctx_tubelets, T_tok - 1))
+        target_tubelet_idx = k_eval
+        ctx_frames_eval = k_eval * tubelet_size
+        eval_limit = max(n_pca_scenes, n_motion_eval_scenes)
+        _enc = target_encoder.module if hasattr(target_encoder, "module") else target_encoder
+        _pred = predictor.module if hasattr(predictor, "module") else predictor
+        _enc.eval()
+        _pred.eval()
+        pca_outputs_written = 0
+        motion_eval_losses = []
+        motion_eval_translation = []
+        motion_eval_rotation_deg = []
+        eval_summary = {
+            "epoch": int(epoch),
+            "context_tubelets": int(k_eval),
+            "target_tubelet_idx": int(target_tubelet_idx),
+            "n_motion_eval_scenes": int(n_motion_eval_scenes),
+            "n_fixed_stride_eval_scenes": int(n_fixed_stride_eval_scenes),
+            "motion_bins": {},
+            "fixed_stride": {},
+            "artifacts": {
+                "training_curves": f"training_curves_e{epoch:03d}.png",
+                "pca_vis_dir": "pca_vis",
+            },
+        }
+
+        def _forward_eval_sample(eval_sample):
+            v_imgs = eval_sample["images"].to(device)
+            v_states = eval_sample["states"].to(device, dtype=torch.float)[:, ::tubelet_size]
+            v_states = _canonicalize_states(v_states)
+            v_actions = eval_sample["actions"].to(device, dtype=torch.float)[:, ::tubelet_size]
+            v_intrinsics = eval_sample["intrinsics"].to(device, dtype=torch.float)[:, ::tubelet_size]
+            full_clip = v_imgs.permute(0, 2, 1, 3, 4)
+            layer_outs = _enc(full_clip)
+            h_tgt_full = _layerlist_to_h_eval(layer_outs)
+            h_tgt = h_tgt_full[0]
+            layer_dim = layer_outs[-1].shape[-1]
+            target_start = target_tubelet_idx * HW
+            target_end = (target_tubelet_idx + 1) * HW
+            h_tgt_last = h_tgt[target_start:target_end, -layer_dim:]
+            h_tgt_eval = h_tgt_full[:, target_start:target_end, :]
+            ctx_clip = v_imgs[:, :ctx_frames_eval].permute(0, 2, 1, 3, 4)
+            ctx_lo = _enc(ctx_clip)
+            h_ctx = torch.cat(ctx_lo, dim=-1)
+            B_v = h_ctx.shape[0]
+            future_tokens_v = _pred.future_mask_token.to(device=device, dtype=h_ctx.dtype).expand(
+                B_v, HW, -1
+            )
+            h_in = torch.cat([h_ctx, future_tokens_v], dim=1)
+            preds_v, _ = _pred(
+                h_in,
+                v_actions[:, :target_tubelet_idx + 1],
+                v_states[:, :target_tubelet_idx + 1],
+                intrinsics=v_intrinsics[:, :target_tubelet_idx + 1] if use_intrinsics else None,
+            )
+            return {
+                "imgs": v_imgs,
+                "preds_next": preds_v[:, -HW:, :],
+                "h_tgt_eval": h_tgt_eval,
+                "h_tgt_last": h_tgt_last,
+                "h_pred_last": preds_v[0, -HW:, -layer_dim:],
+                "rel_action": v_actions[0, target_tubelet_idx - 1],
+            }
+
+        def _run_fixed_stride_eval(eval_loader, max_scenes):
+            losses = []
+            with torch.no_grad():
+                for eval_idx, eval_sample in enumerate(eval_loader):
+                    if eval_idx >= max_scenes:
+                        break
+                    sample_out = _forward_eval_sample(eval_sample)
+                    losses.append(_sample_latent_loss(sample_out["preds_next"], sample_out["h_tgt_eval"]))
+            return losses
+
+        try:
+            with torch.no_grad():
+                for vis_idx, vis_sample in enumerate(pca_loader):
+                    if vis_idx >= eval_limit:
+                        break
+                    sample_out = _forward_eval_sample(vis_sample)
+                    if vis_idx < n_motion_eval_scenes:
+                        motion_eval_losses.append(_sample_latent_loss(sample_out["preds_next"], sample_out["h_tgt_eval"]))
+                        rel_action = sample_out["rel_action"]
+                        motion_eval_translation.append(float(torch.linalg.norm(rel_action[:3]).item()))
+                        motion_eval_rotation_deg.append(_rotation_degrees_from_quat(rel_action[3:]))
+                    if vis_idx < n_pca_scenes:
+                        out_path = os.path.join(pca_vis_dir, f"e{epoch:03d}_scene{vis_idx:02d}.png")
+                        try:
+                            visualize_pca_features(
+                                h_gt=sample_out["h_tgt_last"], h_pred=sample_out["h_pred_last"],
+                                imgs=sample_out["imgs"][0, target_tubelet_idx * tubelet_size:(target_tubelet_idx + 1) * tubelet_size], grid_h=grid_h, grid_w=grid_w,
+                                out_path=out_path, n_frames=1,
+                            )
+                            pca_outputs_written += 1
+                        except Exception as _ve:
+                            logger.warning(f"PCA vis failed for scene {vis_idx}: {_ve}")
+        finally:
+            _enc.train()
+            _pred.train()
+
+        translation_summary = _summarize_motion_bins("translation", motion_eval_translation, motion_eval_losses)
+        rotation_summary = _summarize_motion_bins("rotation_deg", motion_eval_rotation_deg, motion_eval_losses)
+        if translation_summary is not None:
+            eval_summary["motion_bins"]["translation"] = translation_summary
+        if rotation_summary is not None:
+            eval_summary["motion_bins"]["rotation_deg"] = rotation_summary
+        for stride_label, (stride_value, stride_loader) in fixed_stride_eval_loaders.items():
+            stride_losses = _run_fixed_stride_eval(stride_loader, n_fixed_stride_eval_scenes)
+            if len(stride_losses) == 0:
+                logger.warning(f"No fixed-stride eval samples available for {stride_label} stride={stride_value}.")
+                eval_summary["fixed_stride"][stride_label] = {
+                    "stride": int(stride_value),
+                    "loss": None,
+                    "count": 0,
+                }
+            else:
+                mean_stride_loss = float(np.mean(stride_losses))
+                logger.info(
+                    f"Fixed-stride eval [{stride_label}] stride={stride_value} loss={mean_stride_loss:.5f} n={len(stride_losses)}"
+                )
+                eval_summary["fixed_stride"][stride_label] = {
+                    "stride": int(stride_value),
+                    "loss": mean_stride_loss,
+                    "count": int(len(stride_losses)),
+                }
+
+        eval_summary_path = os.path.join(folder, f"eval_summary_e{epoch:03d}.json")
+        try:
+            with open(eval_summary_path, "w") as f:
+                json.dump(eval_summary, f, separators=(",", ":"), sort_keys=True)
+                f.write("\n")
+            _prune_eval_summary_outputs(eval_summary_path)
+            logger.info(f"Eval summary saved to {eval_summary_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write eval summary to {eval_summary_path}: {e}")
+
+        if pca_outputs_written > 0:
+            _prune_pca_outputs(epoch)
+            logger.info(f"PCA visualisations saved to {pca_vis_dir}")
+        else:
+            logger.warning("No PCA visualisations were written; keeping previous PCA outputs.")
 
     # ------------------------------------------------------------------ #
     # TRAINING LOOP
@@ -510,17 +1048,13 @@ def main(args, resume_preempt=False):
                         raise e
 
             def load_batch():
-                # images: [B, T, 3, H, W] → encoder expects [B, C, T, H, W]
                 imgs = sample["images"].to(device, non_blocking=True)
-                # Dataset yields per-frame poses (T=seq_len).
-                # Predictor expects per-tubelet poses (T//tubelet_size).
-                # Subsample: take one pose per tubelet (first frame of each).
-                s = sample["states"].to(device, dtype=torch.float, non_blocking=True)       # [B, T, 7]
-                a = sample["actions"].to(device, dtype=torch.float, non_blocking=True)      # [B, T, 7]
-                k = sample["intrinsics"].to(device, dtype=torch.float, non_blocking=True)   # [B, T, 4]
-                states     = s[:, ::tubelet_size, :]   # [B, T//ts, 7]
-                actions    = a[:, ::tubelet_size, :]   # [B, T//ts, 7]
-                intrinsics = k[:, ::tubelet_size, :]   # [B, T//ts, 4]
+                s = sample["states"].to(device, dtype=torch.float, non_blocking=True)
+                a = sample["actions"].to(device, dtype=torch.float, non_blocking=True)
+                k = sample["intrinsics"].to(device, dtype=torch.float, non_blocking=True)
+                states = s[:, ::tubelet_size, :]
+                actions = a[:, ::tubelet_size, :]
+                intrinsics = k[:, ::tubelet_size, :]
                 return imgs, states, actions, intrinsics
 
             imgs, states, actions, intrinsics = load_batch()
@@ -534,11 +1068,9 @@ def main(args, resume_preempt=False):
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
 
-                HW = (crop_size // patch_size) ** 2          # spatial tokens per tubelet
-                T_tok = seq_len // tubelet_size               # total tubelets
+                HW = (crop_size // patch_size) ** 2
 
                 def _layerlist_to_h(layer_outs):
-                    """list[Tensor[B, T_tok*HW, D]] → [B, T_tok*HW, n_layers*D]"""
                     if normalize_reps:
                         layer_outs = [
                             F.layer_norm(feat, (feat.size(-1),))
@@ -546,56 +1078,46 @@ def main(args, resume_preempt=False):
                         ]
                     return torch.cat(layer_outs, dim=-1)
 
-                # ------------------------------------------------------------ #
-                # 1. TARGET: frozen target_encoder sees the FULL clip
-                # ------------------------------------------------------------ #
                 with torch.no_grad():
-                    full_clip = imgs.permute(0, 2, 1, 3, 4)   # [B, C, T, H, W]
+                    full_clip = imgs.permute(0, 2, 1, 3, 4)
                     h_target = _layerlist_to_h(target_encoder(full_clip))
-                    # h_target: [B, T_tok*HW, n_layers*D]  — ground truth for loss
 
-                # ------------------------------------------------------------ #
-                # 2. CONTEXT: context encoder sees only the first n_ctx_tubelets
-                # ------------------------------------------------------------ #
-                ctx_frames = n_ctx_tubelets * tubelet_size    # raw frames for context
+                if ar_random_context:
+                    k_ctx = random.randint(min_ctx_tubelets, max_ctx_tubelets)
+                else:
+                    k_ctx = n_ctx_tubelets
+                target_tubelet_idx = k_ctx
+                target_start = target_tubelet_idx * HW
+                target_end = (target_tubelet_idx + 1) * HW
+                h_target_next = h_target[:, target_start:target_end, :]
+
+                ctx_frames = k_ctx * tubelet_size
                 ctx_clip = imgs[:, :ctx_frames, :, :, :].permute(0, 2, 1, 3, 4)
-                # encoder runs WITH grad so it can be fine-tuned (enc_lr_scale)
-                ctx_layer_outs = encoder(ctx_clip)            # list[Tensor[B, n_ctx*HW, D]]
-                h_context = _layerlist_to_h(ctx_layer_outs)  # [B, n_ctx*HW, n_layers*D]
+                ctx_layer_outs = encoder(ctx_clip)
+                h_context = _layerlist_to_h(ctx_layer_outs)
+                states_canonical = _canonicalize_states(states)
 
-                # ------------------------------------------------------------ #
-                # 3. PAD future frames with zeros → predictor input
-                # The causal mask prevents future tokens from attending to each
-                # other, so zero-padding is safe: they carry no signal.
-                # ------------------------------------------------------------ #
-                B_sz, N_ctx, D_full = h_context.shape
-                N_future = (T_tok - n_ctx_tubelets) * HW
-                padding = torch.zeros(
-                    B_sz, N_future, D_full,
+                B_sz = h_context.shape[0]
+                predictor_ref = predictor.module if hasattr(predictor, "module") else predictor
+                future_tokens = predictor_ref.future_mask_token.to(
                     device=h_context.device, dtype=h_context.dtype,
                 )
-                h_predictor_input = torch.cat([h_context, padding], dim=1)
-                # h_predictor_input: [B, T_tok*HW, n_layers*D]
+                future_tokens = future_tokens.expand(B_sz, HW, -1)
+                h_predictor_input = torch.cat([h_context, future_tokens], dim=1)
 
-                # ------------------------------------------------------------ #
-                # 4. PREDICTOR: roll out all T_tok tubelets from actions
-                # ------------------------------------------------------------ #
                 def forward_predictor():
-                    preds, ctx_preds = predictor(
+                    preds, _ = predictor(
                         h_predictor_input,
-                        actions,
-                        states,
-                        intrinsics=intrinsics if use_intrinsics else None,
+                        actions[:, :target_tubelet_idx + 1],
+                        states_canonical[:, :target_tubelet_idx + 1],
+                        intrinsics=intrinsics[:, :target_tubelet_idx + 1] if use_intrinsics else None,
                     )
-                    return preds, ctx_preds
+                    return preds
 
-                # ------------------------------------------------------------ #
-                # 5. LOSS: predictor output vs frozen target features
-                # ------------------------------------------------------------ #
-                def loss_fn(preds, ctx_preds, h_tgt):
+                def loss_fn(preds, h_tgt):
                     embed_dim = h_tgt.shape[-1] // n_hierarchical_layers
                     pred_chunks = preds.split(embed_dim, dim=-1)
-                    h_chunks    = h_tgt.split(embed_dim, dim=-1)
+                    h_chunks = h_tgt.split(embed_dim, dim=-1)
                     loss_pred = preds.new_zeros(())
                     for p, t in zip(pred_chunks, h_chunks):
                         t = t.detach()
@@ -606,28 +1128,14 @@ def main(args, resume_preempt=False):
                             torch.mean(torch.abs(p - t) ** loss_exp) / loss_exp
                         )
                     loss_pred = loss_pred / n_hierarchical_layers
-
-                    loss_ctx = preds.new_zeros(())
-                    if ctx_preds is not None:
-                        # Dense context loss: only compare the context tubelet slots
-                        n_ctx_toks = n_ctx_tubelets * HW
-                        ctx_chunks = ctx_preds[:, :n_ctx_toks].split(embed_dim, dim=-1)
-                        h_ctx_chunks = h_tgt[:, :n_ctx_toks].split(embed_dim, dim=-1)
-                        for p, t in zip(ctx_chunks, h_ctx_chunks):
-                            t = t.detach()
-                            if normalize_reps:
-                                p = F.layer_norm(p, (p.size(-1),))
-                                t = F.layer_norm(t, (t.size(-1),))
-                            loss_ctx = loss_ctx + (
-                                torch.mean(torch.abs(p - t) ** loss_exp) / loss_exp
-                            )
-                        loss_ctx = loss_ctx / n_hierarchical_layers
-
-                    return loss_pred + loss_ctx, loss_pred, loss_ctx
+                    return loss_pred
 
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-                    preds, ctx_preds = forward_predictor()
-                    loss, loss_pred, loss_ctx = loss_fn(preds, ctx_preds, h_target)
+                    preds = forward_predictor()
+                    preds_next = preds[:, -HW:, :]
+                    loss = loss_fn(preds_next, h_target_next)
+                    loss_pred = loss
+                    loss_ctx = loss.new_zeros(())
 
                 if mixed_precision:
                     scaler.scale(loss).backward()
@@ -680,7 +1188,6 @@ def main(args, resume_preempt=False):
 
         logger.info("avg. loss %.3f" % loss_meter.avg)
 
-        # -- accumulate epoch-level stats for curves
         training_stats["loss"].append(loss_meter.avg)
         training_stats["loss_pred"].append(loss_pred_meter.avg)
         training_stats["loss_ctx"].append(loss_ctx_meter.avg)
@@ -691,71 +1198,24 @@ def main(args, resume_preempt=False):
         training_stats["mem_gb"].append(torch.cuda.max_memory_allocated() / 1024.0**3)
 
         if epoch > 0 and (epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1)):
-            save_checkpoint(epoch + 1, latest_path)
-            if save_every_freq > 0 and epoch % save_every_freq == 0:
-                save_every_path = os.path.join(scratch_folder, f"e{epoch}.pt")
-                save_checkpoint(epoch + 1, save_every_path)
-                prev_save = os.path.join(scratch_folder, f"e{epoch - save_every_freq}.pt")
-                if rank == 0 and os.path.exists(prev_save):
-                    os.remove(prev_save)
-                    logger.info(f"Removed old checkpoint: {prev_save}")
+            checkpoint_saved = False
+            checkpoint_path = None
+            if epoch == (num_epochs - 1):
+                checkpoint_path = final_path
+                checkpoint_saved = save_checkpoint(epoch + 1, checkpoint_path)
+            elif save_every_freq > 0 and epoch % save_every_freq == 0:
+                checkpoint_path = os.path.join(scratch_folder, f"e{epoch}.pt")
+                checkpoint_saved = save_checkpoint(epoch + 1, checkpoint_path)
+            checkpoint_saved = _broadcast_bool_from_rank0(checkpoint_saved)
 
-                # -- training curves
-                if rank == 0:
-                    from pathlib import Path
-                    try:
-                        plot_training_curves(
-                            training_stats,
-                            Path(folder) / f"training_curves_e{epoch:03d}.png",
-                        )
-                        logger.info(f"Training curves saved to {folder}/training_curves_e{epoch:03d}.png")
-                    except Exception as _ce:
-                        logger.warning(f"Training curves failed: {_ce}")
+            if checkpoint_saved:
+                _prune_checkpoint_outputs(checkpoint_path)
+                run_checkpoint_evaluation(epoch)
+            elif epoch == (num_epochs - 1) or (save_every_freq > 0 and epoch % save_every_freq == 0):
+                logger.warning("Keeping previous checkpoint because the new checkpoint save did not succeed.")
+                logger.warning("Skipping checkpoint evaluation because checkpoint save did not succeed.")
+            _safe_dist_barrier()
 
-        # -- PCA feature visualisation on test scenes
-        if pca_loader is not None and (epoch > 0 and (epoch % VIZ_FREQ == 0 or epoch == (num_epochs - 1))):
-            logger.info("Running PCA feature visualisation...")
-            grid_h = grid_w = crop_size // patch_size
-            HW = grid_h * grid_w
-            T_tok = seq_len // tubelet_size
-            ctx_frames_eval = n_ctx_tubelets * tubelet_size
-            _enc = target_encoder.module if hasattr(target_encoder, "module") else target_encoder
-            _pred = predictor.module if hasattr(predictor, "module") else predictor
-            _enc.eval()
-            _pred.eval()
-            with torch.no_grad():
-                for vis_idx, vis_sample in enumerate(pca_loader):
-                    if vis_idx >= n_pca_scenes:
-                        break
-                    v_imgs  = vis_sample["images"].to(device)
-                    v_states     = vis_sample["states"].to(device, dtype=torch.float)[:, ::tubelet_size]
-                    v_actions    = vis_sample["actions"].to(device, dtype=torch.float)[:, ::tubelet_size]
-                    v_intrinsics = vis_sample["intrinsics"].to(device, dtype=torch.float)[:, ::tubelet_size]
-                    full_clip = v_imgs.permute(0, 2, 1, 3, 4)
-                    layer_outs = _enc(full_clip)
-                    h_tgt = torch.cat(layer_outs, dim=-1)[0]   # [T*HW, L*D] raw, no layer_norm for PCA
-                    _layer_D = layer_outs[-1].shape[-1]
-                    h_tgt_last = h_tgt[..., -_layer_D:]        # [T*HW, D] last layer only
-                    ctx_clip = v_imgs[:, :ctx_frames_eval].permute(0, 2, 1, 3, 4)
-                    ctx_lo = _enc(ctx_clip)
-                    h_ctx = torch.cat(ctx_lo, dim=-1)           # [B, n_ctx*HW, L*D] raw
-                    B_v, N_ctx_v, D_v = h_ctx.shape
-                    pad_v = torch.zeros(B_v, T_tok * HW - N_ctx_v, D_v, device=device, dtype=h_ctx.dtype)
-                    h_in  = torch.cat([h_ctx, pad_v], dim=1)
-                    preds_v, _ = _pred(
-                        h_in, v_actions, v_states,
-                        intrinsics=v_intrinsics if use_intrinsics else None,
-                    )
-                    h_pred_last = preds_v[0][..., -_layer_D:]  # [T*HW, D] last layer only
-                    out_path = os.path.join(pca_vis_dir, f"e{epoch:03d}_scene{vis_idx:02d}.png")
-                    try:
-                        visualize_pca_features(
-                            h_gt=h_tgt_last, h_pred=h_pred_last,
-                            imgs=v_imgs[0], grid_h=grid_h, grid_w=grid_w,
-                            out_path=out_path, n_frames=4,
-                        )
-                    except Exception as _ve:
-                        logger.warning(f"PCA vis failed for scene {vis_idx}: {_ve}")
-            _enc.train()
-            _pred.train()
-            logger.info(f"PCA visualisations saved to {pca_vis_dir}")
+    _shutdown_distributed()
+
+

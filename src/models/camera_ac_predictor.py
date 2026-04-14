@@ -108,6 +108,7 @@ class CameraConditionedPredictorAC(nn.Module):
         self.use_intrinsics = use_intrinsics and (intrinsics_dim > 0)
         self.predict_all = predict_all
         self.n_hierarchical_layers = n_hierarchical_layers
+        self.input_token_dim = embed_dim * n_hierarchical_layers
         self.use_activation_checkpointing = use_activation_checkpointing
         self.init_std = init_std
 
@@ -146,6 +147,7 @@ class CameraConditionedPredictorAC(nn.Module):
         # the concatenation of L encoder-layer outputs.
         # ------------------------------------------------------------------ #
         act_layer_mlp = nn.SiLU if use_silu else nn.GELU
+        self.future_mask_token = nn.Parameter(torch.zeros(1, 1, self.input_token_dim))
         if n_hierarchical_layers == 1:
             self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         else:
@@ -188,18 +190,22 @@ class CameraConditionedPredictorAC(nn.Module):
         if out_embed_dim is None:
             out_embed_dim = embed_dim
         self.out_embed_dim = out_embed_dim
-        total_out_dim = n_hierarchical_layers * out_embed_dim
 
         self.predictor_norm = norm_layer(predictor_embed_dim)
-        self.predictor_proj = nn.Linear(predictor_embed_dim, total_out_dim, bias=True)
+        self.predictor_proj = nn.ModuleList(
+            [nn.Linear(predictor_embed_dim, out_embed_dim, bias=True) for _ in range(n_hierarchical_layers)]
+        )
 
         if self.predict_all:
-            self.predictor_proj_context = nn.Linear(predictor_embed_dim, total_out_dim, bias=True)
+            self.predictor_proj_context = nn.ModuleList(
+                [nn.Linear(predictor_embed_dim, out_embed_dim, bias=True) for _ in range(n_hierarchical_layers)]
+            )
 
         # ------------------------------------------------------------------ #
         # Weight initialisation + block rescaling (mirrors ac_predictor.py)
         # ------------------------------------------------------------------ #
         self.apply(self._init_weights)
+        trunc_normal_(self.future_mask_token, std=self.init_std)
         self._rescale_blocks()
 
         # Pre-compute and register the block-causal attention mask.
@@ -316,10 +322,10 @@ class CameraConditionedPredictorAC(nn.Module):
         x_visual = x_seq[:, :, self.cond_tokens:, :].flatten(1, 2)   # [B, T*H*W, D]
         x_visual = self.predictor_norm(x_visual)
 
-        predictions = self.predictor_proj(x_visual)  # [B, T*H*W, L*out_embed_dim]
+        predictions = torch.cat([head(x_visual) for head in self.predictor_proj], dim=-1)
 
         if self.predict_all:
-            context_predictions = self.predictor_proj_context(x_visual)
+            context_predictions = torch.cat([head(x_visual) for head in self.predictor_proj_context], dim=-1)
             return predictions, context_predictions
 
         return predictions, None

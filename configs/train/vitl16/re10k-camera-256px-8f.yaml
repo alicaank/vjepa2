@@ -13,13 +13,23 @@ data:
   seq_len: 8          # temporal frames per clip
   stride: 4           # temporal stride between sampled frames
   min_stride: 1       # fallback stride for short clips
+  stride_values: [1, 2, 4, 8]
   n_ctx_tubelets: 1   # tubelets shown to context encoder; predictor predicts the rest
+  ar_random_context: true
+  min_ctx_tubelets: 1
+  max_ctx_tubelets: 3
+  n_motion_eval_scenes: 64
+  n_fixed_stride_eval_scenes: 32
+  eval_stride_small: 1
+  eval_stride_medium: 4
+  eval_stride_large: 8
   num_workers: 8
   pin_mem: true
   persistent_workers: true
 loss:
   loss_exp: 1.0
   normalize_reps: true
+  context_loss_weight: 0.0
 meta:
   dtype: bfloat16
   resume_checkpoint: null
@@ -52,7 +62,7 @@ model:
   action_dim: 7       # relative SE(3) delta (translation + quaternion)
   intrinsics_dim: 4   # normalised [fx/W, fy/H, cx/W, cy/H]
   use_intrinsics: true
-  predict_all: true   # dense predictive loss on context tokens
+  predict_all: false
 optimization:
   anneal: 15
   epochs: 50
