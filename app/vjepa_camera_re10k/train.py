@@ -31,7 +31,13 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from app.vjepa_camera_re10k.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
+from app.vjepa_camera_re10k.utils import (
+    encode_clip_as_images,
+    init_opt,
+    init_video_model,
+    load_checkpoint,
+    load_pretrained,
+)
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from src.training.visualization import visualize_pca_features, plot_training_curves
@@ -937,7 +943,7 @@ def main(args, resume_preempt=False):
             v_actions = eval_sample["actions"].to(device, dtype=torch.float)[:, ::tubelet_size]
             v_intrinsics = eval_sample["intrinsics"].to(device, dtype=torch.float)[:, ::tubelet_size]
             full_clip = v_imgs.permute(0, 2, 1, 3, 4)
-            layer_outs = _enc(full_clip)
+            layer_outs = encode_clip_as_images(_enc, full_clip)
             h_tgt_full = _layerlist_to_h_eval(layer_outs)
             h_tgt = h_tgt_full[0]
             layer_dim = layer_outs[-1].shape[-1]
@@ -947,7 +953,7 @@ def main(args, resume_preempt=False):
             h_tgt_last = h_tgt[target_start:target_end, -layer_dim:]
             h_tgt_eval = h_tgt_full[:, target_start:target_end, :]
             ctx_clip = v_imgs[:, :ctx_frames_eval].permute(0, 2, 1, 3, 4)
-            ctx_lo = _enc(ctx_clip)
+            ctx_lo = encode_clip_as_images(_enc, ctx_clip)
             h_ctx = torch.cat(ctx_lo, dim=-1)
             B_v = h_ctx.shape[0]
             future_tokens_v = _pred.future_mask_token.to(device=device, dtype=h_ctx.dtype).expand(
@@ -1144,7 +1150,7 @@ def main(args, resume_preempt=False):
 
                 with torch.no_grad():
                     full_clip = imgs.permute(0, 2, 1, 3, 4)
-                    h_target = _layerlist_to_h(target_encoder(full_clip))
+                    h_target = _layerlist_to_h(encode_clip_as_images(target_encoder, full_clip))
                     h_target_tubelets = [
                         h_target[:, tubelet_idx * HW:(tubelet_idx + 1) * HW, :]
                         for tubelet_idx in range(total_tubelets)
@@ -1165,7 +1171,7 @@ def main(args, resume_preempt=False):
                 ctx_frame_start = local_start * tubelet_size
                 ctx_frame_end = (local_start + k_ctx) * tubelet_size
                 ctx_clip = imgs[:, ctx_frame_start:ctx_frame_end, :, :, :].permute(0, 2, 1, 3, 4)
-                ctx_layer_outs = encoder(ctx_clip)
+                ctx_layer_outs = encode_clip_as_images(encoder, ctx_clip)
                 h_context = torch.cat(ctx_layer_outs, dim=-1)
                 context_latents = [
                     h_context[:, tubelet_idx * HW:(tubelet_idx + 1) * HW, :]

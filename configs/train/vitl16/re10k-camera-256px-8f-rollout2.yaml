@@ -1,6 +1,6 @@
 app: vjepa_camera_re10k
 cpus_per_task: 8
-folder: /home/ak/GWM/predictor_output
+folder: /home/ak/GWM/predictor_output_rollout2
 mem_per_gpu: 80G
 nodes: 2
 tasks_per_node: 8
@@ -14,13 +14,16 @@ data:
   # predictor only, not in the encoder's tubelet convolution.
   tubelet_size: 1
   seq_len: 8          # temporal frames per clip (each is one image-path tubelet)
-  stride: 4           # temporal stride between sampled frames
-  min_stride: 1       # fallback stride for short clips
+  stride: 4
+  min_stride: 1
   stride_values: [1, 2, 4, 8]
-  n_ctx_tubelets: 1   # tubelets shown to context encoder; predictor predicts the rest
+  n_ctx_tubelets: 1
   ar_random_context: true
   ar_random_local_window: false
   min_ctx_tubelets: 1
+  # rollout_train_steps=2 requires total_tubelets - rollout_train_steps >= max_ctx_tubelets;
+  # total_tubelets=8, so max_ctx_tubelets<=6. Capped at 3 to match the 1-step config's
+  # ablation surface and keep the effective local window comparable.
   max_ctx_tubelets: 3
   n_motion_eval_scenes: 64
   n_fixed_stride_eval_scenes: 32
@@ -34,14 +37,16 @@ loss:
   loss_exp: 1.0
   normalize_reps: true
   context_loss_weight: 0.0
-  rollout_train_steps: 1
+  # Two-step rollout: the predictor must produce tubelet t+1 AND t+2, where the
+  # t+2 prediction is conditioned on the predictor's own t+1 output (not on the
+  # teacher-forced target). Per-step weight is rollout_loss_decay^step.
+  rollout_train_steps: 2
   rollout_loss_decay: 0.5
 meta:
   dtype: bfloat16
   resume_checkpoint: null
   load_predictor: false
   load_encoder: true
-  # V-JEPA 2.1 ViT-L checkpoint (distilled from ViT-G teacher, 384px)
   pretrain_checkpoint: https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt
   context_encoder_key: ema_encoder
   target_encoder_key: ema_encoder
@@ -62,17 +67,12 @@ model:
   use_silu: false
   use_pred_silu: false
   wide_silu: true
-  # V-JEPA 2.1 hierarchical features
-  n_hierarchical_layers: 4   # encoder layers whose outputs are concatenated
-  # Camera conditioning
-  state_dim: 7        # 3D translation + 4D quaternion
-  action_dim: 7       # relative SE(3) delta (translation + quaternion)
-  intrinsics_dim: 4   # normalised [fx/W, fy/H, cx/W, cy/H]
+  n_hierarchical_layers: 4
+  state_dim: 7
+  action_dim: 7
+  intrinsics_dim: 4
   use_intrinsics: true
   predict_all: false
-  # Advanced CameraAC predictor features (all implemented in
-  # src/models/camera_ac_predictor.py). future_mask_token is always-on and
-  # independent of these flags.
   use_ray_pe: true
   ray_pe_dim: 6
   ray_pe_hidden: 256
@@ -91,7 +91,7 @@ optimization:
   start_lr: 0.00005
   warmup: 10
   weight_decay: 0.04
-  enc_lr_scale: 0.1   # encoder LR is 10x lower (mostly frozen)
+  enc_lr_scale: 0.1
   betas:
   - 0.9
   - 0.999

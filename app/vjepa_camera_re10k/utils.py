@@ -10,7 +10,11 @@ import sys
 import torch
 
 import src.models.camera_ac_predictor as cam_pred
-import src.models.vision_transformer as video_vit
+# V-JEPA 2.1 vision transformer (image path). The V-JEPA 2 transformer
+# (src.models.vision_transformer) has no img_temporal_dim_size / patch_embed_img
+# and is video-only with tubelet_size=2. CameraAC now consumes single images
+# via V-JEPA 2.1's patch_embed_img; see _make_vjepa2_1_model in src/hub/backbones.py.
+import app.vjepa_2_1.models.vision_transformer as video_vit
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.schedulers import CosineWDSchedule, WSDSchedule
 
@@ -208,6 +212,55 @@ def load_checkpoint(
     return encoder, predictor, target_encoder, opt, scaler, epoch
 
 
+def encode_clip_as_images(encoder, clip_bcthw):
+    """Run a V-JEPA 2.1 ViT (with img_temporal_dim_size=1) via the image path.
+
+    The V-JEPA 2.1 ViT auto-selects between patch_embed_img (image path,
+    used when x.shape[2] == img_temporal_dim_size == 1) and patch_embed
+    (video path, used when tubeleting T frames together). CameraAC now
+    encodes each frame as a single image: T is flattened into the batch
+    dimension so each forward sees (B*T, C, 1, H, W) and takes the image path.
+
+    Args:
+        encoder: a V-JEPA 2.1 VisionTransformer built with img_temporal_dim_size=1
+            and out_layers set (so forward returns a list of per-layer tensors).
+        clip_bcthw: (B, C, T, H, W) clip tensor.
+
+    Returns:
+        A list of per-layer tensors, each shape (B, T*HW, D) where HW is the
+        per-image token count (e.g. 576 for img_size=384, patch_size=16).
+        The (T*HW) layout matches the concatenation CameraAC's train.py
+        expects: per-tubelet slices of size HW laid out along the token axis.
+    """
+    if clip_bcthw.ndim != 5:
+        raise ValueError(
+            f"encode_clip_as_images expects (B,C,T,H,W); got shape={tuple(clip_bcthw.shape)}"
+        )
+    B, C, T, H, W = clip_bcthw.shape
+    # (B, C, T, H, W) -> (B, T, C, H, W) -> (B*T, C, H, W) -> (B*T, C, 1, H, W)
+    imgs = clip_bcthw.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W).unsqueeze(2)
+    layer_outs = encoder(imgs)
+    if not isinstance(layer_outs, (list, tuple)):
+        raise RuntimeError(
+            "V-JEPA 2.1 encoder returned a single tensor; CameraAC requires out_layers "
+            "to be set so the forward returns a list of per-layer tensors."
+        )
+    reshaped = []
+    for lo in layer_outs:
+        if lo.ndim != 3:
+            raise RuntimeError(
+                f"Expected per-layer output shape (B*T, HW, D); got {tuple(lo.shape)}"
+            )
+        BT_, HW_, D_ = lo.shape
+        if BT_ != B * T:
+            raise RuntimeError(
+                f"V-JEPA 2.1 image-path batch mismatch: expected {B*T} got {BT_}"
+            )
+        # (B*T, HW, D) -> (B, T, HW, D) -> (B, T*HW, D)
+        reshaped.append(lo.reshape(B, T, HW_, D_).reshape(B, T * HW_, D_))
+    return reshaped
+
+
 def init_video_model(
     device,
     patch_size=16,
@@ -259,45 +312,17 @@ def init_video_model(
         f"use_residual_head={use_residual_head} (depth={residual_head_depth}, ratio={residual_head_ratio})"
     )
 
-    # Build the encoder.  We instantiate it first without out_layers to read
-    # the total block depth, then reinitialise with the last n_hierarchical_layers.
-    _enc_tmp = video_vit.__dict__[model_name](
-        img_size=crop_size, patch_size=patch_size, num_frames=max_num_frames,
-        tubelet_size=tubelet_size, uniform_power=uniform_power, use_sdpa=use_sdpa,
-        use_silu=use_silu, wide_silu=wide_silu,
-        use_activation_checkpointing=use_activation_checkpointing, use_rope=use_rope,
-    )
-    n_blocks = len(_enc_tmp.blocks)
-    del _enc_tmp
-    # Layer-selection policy.
-    #   * Default: the last n_hierarchical_layers consecutive blocks
-    #     (original V-JEPA 2.1 camera-predictor convention).
-    #   * Override: set VJEPA_OUT_LAYERS="11,23,35,47" (or any comma-separated
-    #     list) to pick explicit block indices — e.g. evenly-spaced taps that
-    #     match the decoder's hierarchical-feature contract for 48-layer
-    #     gigantic encoders. The list length MUST equal n_hierarchical_layers
-    #     because the predictor splits its per-layer feature dim by that count
-    #     (see ``_sample_latent_loss`` / loss_fn in train.py).
-    out_layers_override = _env_int_list("VJEPA_OUT_LAYERS")
-    if out_layers_override is not None:
-        if len(out_layers_override) != n_hierarchical_layers:
-            raise ValueError(
-                f"VJEPA_OUT_LAYERS has {len(out_layers_override)} entries "
-                f"({out_layers_override}) but n_hierarchical_layers={n_hierarchical_layers}. "
-                f"They must match because the predictor splits target features by this count."
-            )
-        for idx in out_layers_override:
-            if idx < 0 or idx >= n_blocks:
-                raise ValueError(
-                    f"VJEPA_OUT_LAYERS index {idx} is out of range for an encoder "
-                    f"with {n_blocks} blocks (valid: 0..{n_blocks - 1})."
-                )
-        out_layers = list(out_layers_override)
-        logger.info(f"Using VJEPA_OUT_LAYERS override: {out_layers} (n_blocks={n_blocks})")
-    else:
-        out_layers = list(range(n_blocks - n_hierarchical_layers, n_blocks))
-        logger.info(f"Using default last-{n_hierarchical_layers} out_layers: {out_layers} (n_blocks={n_blocks})")
-    encoder = video_vit.__dict__[model_name](
+    # Build the encoder. Instantiate once without out_layers so we can read the
+    # canonical V-JEPA 2.1 hierarchical_layers (which the ViT hardcodes per
+    # depth: [5,11,17,23] for depth 24, [11,23,37,47] for depth 48, etc.).
+    # V-JEPA 2.1's forward indexes norms_block via hierarchical_layers.index(i),
+    # so out_layers MUST be a subset of hierarchical_layers.
+    #
+    # img_temporal_dim_size=1 activates patch_embed_img (single-image path) in
+    # addition to patch_embed (video path); the forward auto-selects based on
+    # the input's T dimension (==1 -> image path). interpolate_rope=True matches
+    # the _make_vjepa2_1_model recipe in src/hub/backbones.py.
+    _vit_kwargs = dict(
         img_size=crop_size,
         patch_size=patch_size,
         num_frames=max_num_frames,
@@ -308,6 +333,53 @@ def init_video_model(
         wide_silu=wide_silu,
         use_activation_checkpointing=use_activation_checkpointing,
         use_rope=use_rope,
+        img_temporal_dim_size=1,
+        interpolate_rope=True,
+    )
+    _enc_tmp = video_vit.__dict__[model_name](**_vit_kwargs)
+    n_blocks = len(_enc_tmp.blocks)
+    canonical_hier = list(_enc_tmp.hierarchical_layers)
+    del _enc_tmp
+    # Layer-selection policy.
+    #   * Default: the canonical V-JEPA 2.1 hierarchical layers
+    #     (e.g. [5,11,17,23] for vit_large). These are the only indices with
+    #     pretrained norms_block weights in the V-JEPA 2.1 checkpoint.
+    #   * Override: set VJEPA_OUT_LAYERS to an explicit list that is a
+    #     subset of the canonical hierarchical layers. Arbitrary (non-canonical)
+    #     indices are rejected because they would index norms_block out of range.
+    out_layers_override = _env_int_list("VJEPA_OUT_LAYERS")
+    if out_layers_override is not None:
+        if len(out_layers_override) != n_hierarchical_layers:
+            raise ValueError(
+                f"VJEPA_OUT_LAYERS has {len(out_layers_override)} entries "
+                f"({out_layers_override}) but n_hierarchical_layers={n_hierarchical_layers}. "
+                f"They must match because the predictor splits target features by this count."
+            )
+        for idx in out_layers_override:
+            if idx not in canonical_hier:
+                raise ValueError(
+                    f"VJEPA_OUT_LAYERS index {idx} is not in V-JEPA 2.1 canonical "
+                    f"hierarchical_layers {canonical_hier} for an encoder with {n_blocks} "
+                    f"blocks. The V-JEPA 2.1 ViT only has norms_block weights for these "
+                    f"indices, so picking others would break checkpoint loading and forward."
+                )
+        out_layers = list(out_layers_override)
+        logger.info(f"Using VJEPA_OUT_LAYERS override: {out_layers} (canonical={canonical_hier})")
+    else:
+        if n_hierarchical_layers != len(canonical_hier):
+            raise ValueError(
+                f"n_hierarchical_layers={n_hierarchical_layers} does not match the V-JEPA 2.1 "
+                f"canonical hierarchical_layers={canonical_hier} (len={len(canonical_hier)}). "
+                f"Set model.n_hierarchical_layers={len(canonical_hier)} in the YAML or "
+                f"override with VJEPA_OUT_LAYERS."
+            )
+        out_layers = list(canonical_hier)
+        logger.info(
+            f"Using canonical V-JEPA 2.1 hierarchical out_layers: {out_layers} "
+            f"(n_blocks={n_blocks})"
+        )
+    encoder = video_vit.__dict__[model_name](
+        **_vit_kwargs,
         out_layers=out_layers,
     )
 
