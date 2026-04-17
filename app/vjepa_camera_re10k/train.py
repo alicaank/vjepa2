@@ -223,6 +223,14 @@ def main(args, resume_preempt=False):
     state_dim = cfgs_model.get("state_dim", 7)
     action_dim = cfgs_model.get("action_dim", 7)
     intrinsics_dim = cfgs_model.get("intrinsics_dim", 4)
+    use_ray_pe = bool(cfgs_model.get("use_ray_pe", False))
+    ray_pe_dim = int(cfgs_model.get("ray_pe_dim", 6))
+    ray_pe_hidden = int(cfgs_model.get("ray_pe_hidden", 256))
+    use_delta_head = bool(cfgs_model.get("use_delta_head", False))
+    delta_loss_weight = float(cfgs_model.get("delta_loss_weight", 0.25))
+    use_residual_head = bool(cfgs_model.get("use_residual_head", False))
+    residual_head_depth = int(cfgs_model.get("residual_head_depth", 2))
+    residual_head_ratio = float(cfgs_model.get("residual_head_ratio", 2.0))
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -252,6 +260,7 @@ def main(args, resume_preempt=False):
     # The predictor must hallucinate the remaining (T_tok - n_ctx_tubelets) tubelets.
     n_ctx_tubelets = cfgs_data.get("n_ctx_tubelets", 1)
     ar_random_context = bool(cfgs_data.get("ar_random_context", False))
+    ar_random_local_window = bool(cfgs_data.get("ar_random_local_window", False))
     min_ctx_tubelets = int(cfgs_data.get("min_ctx_tubelets", 1))
     max_ctx_tubelets = cfgs_data.get("max_ctx_tubelets", None)
     if max_ctx_tubelets in (None, ""):
@@ -287,6 +296,15 @@ def main(args, resume_preempt=False):
     cfgs_loss = args.get("loss")
     loss_exp = cfgs_loss.get("loss_exp", 1.0)
     normalize_reps = cfgs_loss.get("normalize_reps", True)
+    rollout_train_steps = max(1, int(cfgs_loss.get("rollout_train_steps", 1)))
+    rollout_loss_decay = float(cfgs_loss.get("rollout_loss_decay", 0.5))
+    rollout_train_steps = min(rollout_train_steps, max_valid_ctx_tubelets)
+    max_rollout_ctx_tubelets = max(1, total_tubelets - rollout_train_steps)
+    if rollout_train_steps > 1 and max_ctx_tubelets > max_rollout_ctx_tubelets:
+        logger.warning(
+            f"rollout_train_steps={rollout_train_steps} with total_tubelets={total_tubelets} "
+            f"caps effective training context to at most {max_rollout_ctx_tubelets} tubelets."
+        )
 
     # -- OPTIMIZATION
     cfgs_opt = args.get("optimization")
@@ -345,6 +363,8 @@ def main(args, resume_preempt=False):
         ("%.5f", "loss"),
         ("%.5f", "loss_pred"),
         ("%.5f", "loss_ctx"),
+        ("%.5f", "loss_step1"),
+        ("%.5f", "loss_step2"),
         ("%d", "iter-time(ms)"),
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
@@ -377,6 +397,13 @@ def main(args, resume_preempt=False):
         intrinsics_dim=intrinsics_dim,
         use_intrinsics=use_intrinsics,
         predict_all=predict_all,
+        use_ray_pe=use_ray_pe,
+        ray_pe_dim=ray_pe_dim,
+        ray_pe_hidden=ray_pe_hidden,
+        use_delta_head=use_delta_head,
+        use_residual_head=use_residual_head,
+        residual_head_depth=residual_head_depth,
+        residual_head_ratio=residual_head_ratio,
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -770,8 +797,18 @@ def main(args, resume_preempt=False):
         gc.disable()
         gc.collect()
 
-    training_stats = {"loss": [], "loss_pred": [], "loss_ctx": [], "lr": [], "wd": [],
-                      "iter_ms": [], "gpu_ms": [], "mem_gb": []}
+    training_stats = {
+        "loss": [],
+        "loss_pred": [],
+        "loss_ctx": [],
+        "loss_step1": [],
+        "loss_step2": [],
+        "lr": [],
+        "wd": [],
+        "iter_ms": [],
+        "gpu_ms": [],
+        "mem_gb": [],
+    }
 
     def run_checkpoint_evaluation(epoch, previous_epoch=None):
         if rank != 0:
@@ -870,7 +907,6 @@ def main(args, resume_preempt=False):
         T_tok = seq_len // tubelet_size
         k_eval = max(1, min(n_ctx_tubelets, T_tok - 1))
         target_tubelet_idx = k_eval
-        ctx_frames_eval = k_eval * tubelet_size
         eval_limit = max(n_pca_scenes, n_motion_eval_scenes)
         _enc = target_encoder.module if hasattr(target_encoder, "module") else target_encoder
         _pred = predictor.module if hasattr(predictor, "module") else predictor
@@ -894,7 +930,7 @@ def main(args, resume_preempt=False):
             },
         }
 
-        def _forward_eval_sample(eval_sample):
+        def _forward_eval_sample(eval_sample, target_idx):
             v_imgs = eval_sample["images"].to(device)
             v_states = eval_sample["states"].to(device, dtype=torch.float)[:, ::tubelet_size]
             v_states = _canonicalize_states(v_states)
@@ -905,8 +941,9 @@ def main(args, resume_preempt=False):
             h_tgt_full = _layerlist_to_h_eval(layer_outs)
             h_tgt = h_tgt_full[0]
             layer_dim = layer_outs[-1].shape[-1]
-            target_start = target_tubelet_idx * HW
-            target_end = (target_tubelet_idx + 1) * HW
+            ctx_frames_eval = target_idx * tubelet_size
+            target_start = target_idx * HW
+            target_end = (target_idx + 1) * HW
             h_tgt_last = h_tgt[target_start:target_end, -layer_dim:]
             h_tgt_eval = h_tgt_full[:, target_start:target_end, :]
             ctx_clip = v_imgs[:, :ctx_frames_eval].permute(0, 2, 1, 3, 4)
@@ -917,11 +954,11 @@ def main(args, resume_preempt=False):
                 B_v, HW, -1
             )
             h_in = torch.cat([h_ctx, future_tokens_v], dim=1)
-            preds_v, _ = _pred(
+            preds_v, _, _delta_v = _pred(
                 h_in,
-                v_actions[:, :target_tubelet_idx + 1],
-                v_states[:, :target_tubelet_idx + 1],
-                intrinsics=v_intrinsics[:, :target_tubelet_idx + 1] if use_intrinsics else None,
+                v_actions[:, :target_idx + 1],
+                v_states[:, :target_idx + 1],
+                intrinsics=v_intrinsics[:, :target_idx + 1] if use_intrinsics else None,
             )
             return {
                 "imgs": v_imgs,
@@ -929,7 +966,26 @@ def main(args, resume_preempt=False):
                 "h_tgt_eval": h_tgt_eval,
                 "h_tgt_last": h_tgt_last,
                 "h_pred_last": preds_v[0, -HW:, -layer_dim:],
-                "rel_action": v_actions[0, target_tubelet_idx - 1],
+                "rel_action": v_actions[0, target_idx - 1],
+            }
+
+        def _build_pca_vis_sample(eval_sample):
+            pca_target_indices = list(range(1, T_tok))
+            pca_targets_gt = []
+            pca_targets_pred = []
+            pca_rgb_frames = []
+            pca_frame_labels = []
+            for pca_target_idx in pca_target_indices:
+                sample_out = _forward_eval_sample(eval_sample, pca_target_idx)
+                pca_targets_gt.append(sample_out["h_tgt_last"])
+                pca_targets_pred.append(sample_out["h_pred_last"])
+                pca_rgb_frames.append(sample_out["imgs"][0, pca_target_idx * tubelet_size])
+                pca_frame_labels.append(f"tubelet {pca_target_idx}")
+            return {
+                "h_gt": torch.cat(pca_targets_gt, dim=0),
+                "h_pred": torch.cat(pca_targets_pred, dim=0),
+                "imgs": torch.stack(pca_rgb_frames, dim=0),
+                "frame_labels": pca_frame_labels,
             }
 
         def _run_fixed_stride_eval(eval_loader, max_scenes):
@@ -938,7 +994,7 @@ def main(args, resume_preempt=False):
                 for eval_idx, eval_sample in enumerate(eval_loader):
                     if eval_idx >= max_scenes:
                         break
-                    sample_out = _forward_eval_sample(eval_sample)
+                    sample_out = _forward_eval_sample(eval_sample, target_tubelet_idx)
                     losses.append(_sample_latent_loss(sample_out["preds_next"], sample_out["h_tgt_eval"]))
             return losses
 
@@ -947,7 +1003,7 @@ def main(args, resume_preempt=False):
                 for vis_idx, vis_sample in enumerate(pca_loader):
                     if vis_idx >= eval_limit:
                         break
-                    sample_out = _forward_eval_sample(vis_sample)
+                    sample_out = _forward_eval_sample(vis_sample, target_tubelet_idx)
                     if vis_idx < n_motion_eval_scenes:
                         motion_eval_losses.append(_sample_latent_loss(sample_out["preds_next"], sample_out["h_tgt_eval"]))
                         rel_action = sample_out["rel_action"]
@@ -956,10 +1012,16 @@ def main(args, resume_preempt=False):
                     if vis_idx < n_pca_scenes:
                         out_path = os.path.join(pca_vis_dir, f"e{epoch:03d}_scene{vis_idx:02d}.png")
                         try:
+                            pca_sample = _build_pca_vis_sample(vis_sample)
                             visualize_pca_features(
-                                h_gt=sample_out["h_tgt_last"], h_pred=sample_out["h_pred_last"],
-                                imgs=sample_out["imgs"][0, target_tubelet_idx * tubelet_size:(target_tubelet_idx + 1) * tubelet_size], grid_h=grid_h, grid_w=grid_w,
-                                out_path=out_path, n_frames=1,
+                                h_gt=pca_sample["h_gt"],
+                                h_pred=pca_sample["h_pred"],
+                                imgs=pca_sample["imgs"],
+                                grid_h=grid_h,
+                                grid_w=grid_w,
+                                out_path=out_path,
+                                n_frames=len(pca_sample["frame_labels"]),
+                                frame_labels=pca_sample["frame_labels"],
                             )
                             pca_outputs_written += 1
                         except Exception as _ve:
@@ -1021,6 +1083,8 @@ def main(args, resume_preempt=False):
         loss_meter = AverageMeter()
         loss_pred_meter = AverageMeter()
         loss_ctx_meter = AverageMeter()
+        loss_step1_meter = AverageMeter()
+        loss_step2_meter = AverageMeter()
         iter_time_meter = AverageMeter()
         gpu_time_meter = AverageMeter()
         data_elapsed_time_meter = AverageMeter()
@@ -1081,38 +1145,58 @@ def main(args, resume_preempt=False):
                 with torch.no_grad():
                     full_clip = imgs.permute(0, 2, 1, 3, 4)
                     h_target = _layerlist_to_h(target_encoder(full_clip))
+                    h_target_tubelets = [
+                        h_target[:, tubelet_idx * HW:(tubelet_idx + 1) * HW, :]
+                        for tubelet_idx in range(total_tubelets)
+                    ]
 
                 if ar_random_context:
-                    k_ctx = random.randint(min_ctx_tubelets, max_ctx_tubelets)
+                    sampled_k_ctx = random.randint(min_ctx_tubelets, max_ctx_tubelets)
                 else:
-                    k_ctx = n_ctx_tubelets
-                target_tubelet_idx = k_ctx
-                target_start = target_tubelet_idx * HW
-                target_end = (target_tubelet_idx + 1) * HW
-                h_target_next = h_target[:, target_start:target_end, :]
+                    sampled_k_ctx = n_ctx_tubelets
+                effective_rollout_steps = min(rollout_train_steps, total_tubelets - 1)
+                k_ctx = max(1, min(int(sampled_k_ctx), total_tubelets - effective_rollout_steps))
+                max_local_start = total_tubelets - k_ctx - effective_rollout_steps
+                if ar_random_local_window and max_local_start > 0:
+                    local_start = random.randint(0, max_local_start)
+                else:
+                    local_start = 0
 
-                ctx_frames = k_ctx * tubelet_size
-                ctx_clip = imgs[:, :ctx_frames, :, :, :].permute(0, 2, 1, 3, 4)
+                ctx_frame_start = local_start * tubelet_size
+                ctx_frame_end = (local_start + k_ctx) * tubelet_size
+                ctx_clip = imgs[:, ctx_frame_start:ctx_frame_end, :, :, :].permute(0, 2, 1, 3, 4)
                 ctx_layer_outs = encoder(ctx_clip)
-                h_context = _layerlist_to_h(ctx_layer_outs)
-                states_canonical = _canonicalize_states(states)
-
-                B_sz = h_context.shape[0]
+                h_context = torch.cat(ctx_layer_outs, dim=-1)
+                context_latents = [
+                    h_context[:, tubelet_idx * HW:(tubelet_idx + 1) * HW, :]
+                    for tubelet_idx in range(k_ctx)
+                ]
                 predictor_ref = predictor.module if hasattr(predictor, "module") else predictor
-                future_tokens = predictor_ref.future_mask_token.to(
-                    device=h_context.device, dtype=h_context.dtype,
-                )
-                future_tokens = future_tokens.expand(B_sz, HW, -1)
-                h_predictor_input = torch.cat([h_context, future_tokens], dim=1)
 
-                def forward_predictor():
-                    preds, _ = predictor(
-                        h_predictor_input,
-                        actions[:, :target_tubelet_idx + 1],
-                        states_canonical[:, :target_tubelet_idx + 1],
-                        intrinsics=intrinsics[:, :target_tubelet_idx + 1] if use_intrinsics else None,
+                def forward_predictor(step_context_latents, target_tubelet_idx):
+                    h_context_step = torch.cat(step_context_latents, dim=1)
+                    B_sz = h_context_step.shape[0]
+                    current_local_start = target_tubelet_idx - len(step_context_latents)
+                    local_states = _canonicalize_states(states[:, current_local_start:target_tubelet_idx + 1])
+                    local_actions = actions[:, current_local_start:target_tubelet_idx + 1]
+                    local_intrinsics = (
+                        intrinsics[:, current_local_start:target_tubelet_idx + 1] if use_intrinsics else None
                     )
-                    return preds
+                    future_tokens = predictor_ref.future_mask_token.to(
+                        device=h_context_step.device,
+                        dtype=h_context_step.dtype,
+                    )
+                    future_tokens = future_tokens.expand(B_sz, HW, -1)
+                    h_predictor_input = torch.cat([h_context_step, future_tokens], dim=1)
+                    preds, _, delta_preds = predictor(
+                        h_predictor_input,
+                        local_actions,
+                        local_states,
+                        intrinsics=local_intrinsics,
+                    )
+                    if delta_preds is not None:
+                        return preds[:, -HW:, :], delta_preds[:, -HW:, :]
+                    return preds[:, -HW:, :], None
 
                 def loss_fn(preds, h_tgt):
                     embed_dim = h_tgt.shape[-1] // n_hierarchical_layers
@@ -1131,11 +1215,44 @@ def main(args, resume_preempt=False):
                     return loss_pred
 
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-                    preds = forward_predictor()
-                    preds_next = preds[:, -HW:, :]
-                    loss = loss_fn(preds_next, h_target_next)
-                    loss_pred = loss
-                    loss_ctx = loss.new_zeros(())
+                    step_losses = []
+                    delta_losses = []
+                    rollout_context_latents = list(context_latents)
+                    prev_target_latents = None
+                    for rollout_step in range(effective_rollout_steps):
+                        target_tubelet_idx = local_start + k_ctx + rollout_step
+                        preds_next, delta_preds_next = forward_predictor(
+                            rollout_context_latents,
+                            target_tubelet_idx,
+                        )
+                        h_tgt_this = h_target_tubelets[target_tubelet_idx]
+                        step_losses.append(loss_fn(preds_next, h_tgt_this))
+
+                        if use_delta_head and delta_preds_next is not None:
+                            if prev_target_latents is None:
+                                ctx_last_idx = target_tubelet_idx - 1
+                                h_current = h_target_tubelets[ctx_last_idx]
+                            else:
+                                h_current = prev_target_latents
+                            delta_target = h_tgt_this - h_current.detach()
+                            delta_losses.append(loss_fn(delta_preds_next, delta_target))
+                        prev_target_latents = h_tgt_this
+
+                        rollout_context_latents = (rollout_context_latents + [preds_next])[-k_ctx:]
+
+                    loss_pred = step_losses[0]
+                    loss_step1 = step_losses[0]
+                    loss_step2 = step_losses[1] if len(step_losses) > 1 else loss_pred.new_zeros(())
+                    loss_ctx = loss_pred.new_zeros(())
+                    step_weight = rollout_loss_decay
+                    for step_loss in step_losses[1:]:
+                        loss_ctx = loss_ctx + step_weight * step_loss
+                        step_weight = step_weight * rollout_loss_decay
+                    loss = loss_pred + loss_ctx
+
+                    if use_delta_head and delta_losses:
+                        loss_delta_total = sum(delta_losses) / len(delta_losses)
+                        loss = loss + delta_loss_weight * loss_delta_total
 
                 if mixed_precision:
                     scaler.scale(loss).backward()
@@ -1149,32 +1266,43 @@ def main(args, resume_preempt=False):
                     optimizer.step()
                 optimizer.zero_grad()
 
-                return loss.item(), loss_pred.item(), loss_ctx.item(), _new_lr, _new_wd
+                return (
+                    loss.item(),
+                    loss_pred.item(),
+                    loss_ctx.item(),
+                    loss_step1.item(),
+                    loss_step2.item(),
+                    _new_lr,
+                    _new_wd,
+                )
 
-            (loss, loss_pred, loss_ctx, _new_lr, _new_wd), gpu_etime_ms = gpu_timer(train_step)
+            (loss, loss_pred, loss_ctx, loss_step1, loss_step2, _new_lr, _new_wd), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             loss_meter.update(loss)
             loss_pred_meter.update(loss_pred)
             loss_ctx_meter.update(loss_ctx)
+            loss_step1_meter.update(loss_step1)
+            loss_step2_meter.update(loss_step2)
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)
             data_elapsed_time_meter.update(data_elapsed_time_ms)
 
             def log_stats():
                 csv_logger.log(
-                    epoch + 1, itr, loss, loss_pred, loss_ctx,
+                    epoch + 1, itr, loss, loss_pred, loss_ctx, loss_step1, loss_step2,
                     iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms,
                 )
                 if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
                     logger.info(
-                        "[%d, %5d] loss: %.3f [pred: %.3f ctx: %.3f] "
+                        "[%d, %5d] loss: %.3f [pred: %.3f ctx: %.3f step1: %.3f step2: %.3f] "
                         "[wd: %.2e] [lr: %.2e] "
                         "[mem: %.2e] "
                         "[iter: %.1f ms] [gpu: %.1f ms] [data: %.1f ms]"
                         % (
                             epoch + 1, itr,
                             loss_meter.avg, loss_pred_meter.avg, loss_ctx_meter.avg,
+                            loss_step1_meter.avg, loss_step2_meter.avg,
                             _new_wd, _new_lr,
                             torch.cuda.max_memory_allocated() / 1024.0**2,
                             iter_time_meter.avg,
@@ -1191,6 +1319,8 @@ def main(args, resume_preempt=False):
         training_stats["loss"].append(loss_meter.avg)
         training_stats["loss_pred"].append(loss_pred_meter.avg)
         training_stats["loss_ctx"].append(loss_ctx_meter.avg)
+        training_stats["loss_step1"].append(loss_step1_meter.avg)
+        training_stats["loss_step2"].append(loss_step2_meter.avg)
         training_stats["lr"].append(scheduler.get_last_lr() if hasattr(scheduler, "get_last_lr") else _new_lr)
         training_stats["wd"].append(_new_wd)
         training_stats["iter_ms"].append(iter_time_meter.avg)
@@ -1217,5 +1347,3 @@ def main(args, resume_preempt=False):
             _safe_dist_barrier()
 
     _shutdown_distributed()
-
-

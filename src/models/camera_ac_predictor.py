@@ -100,12 +100,22 @@ class CameraConditionedPredictorAC(nn.Module):
         use_silu=False,
         wide_silu=True,
         use_activation_checkpointing=False,
+        use_ray_pe=False,
+        ray_pe_dim=6,
+        ray_pe_hidden=256,
+        use_delta_head=False,
+        use_residual_head=False,
+        residual_head_depth=2,
+        residual_head_ratio=2.0,
         **kwargs,
     ):
         super().__init__()
 
         self.is_frame_causal = is_frame_causal
         self.use_intrinsics = use_intrinsics and (intrinsics_dim > 0)
+        self.use_ray_pe = use_ray_pe
+        self.use_delta_head = use_delta_head
+        self.use_residual_head = use_residual_head
         self.predict_all = predict_all
         self.n_hierarchical_layers = n_hierarchical_layers
         self.input_token_dim = embed_dim * n_hierarchical_layers
@@ -139,6 +149,22 @@ class CameraConditionedPredictorAC(nn.Module):
         #   [action, state]         → cond_tokens = 2
         #   [action, state, K]      → cond_tokens = 3
         self.cond_tokens = 3 if self.use_intrinsics else 2
+
+        if self.use_ray_pe:
+            self.ray_pe_mlp = nn.Sequential(
+                nn.Linear(ray_pe_dim, ray_pe_hidden, bias=True),
+                nn.GELU(),
+                nn.Linear(ray_pe_hidden, predictor_embed_dim, bias=True),
+            )
+            gh, gw = self.grid_height, self.grid_width
+            cy_grid = (torch.arange(gh, dtype=torch.float32) + 0.5) / gh
+            cx_grid = (torch.arange(gw, dtype=torch.float32) + 0.5) / gw
+            yy, xx = torch.meshgrid(cy_grid, cx_grid, indexing="ij")
+            self.register_buffer(
+                "_ray_pixel_grid",
+                torch.stack([xx, yy], dim=-1).reshape(-1, 2),
+                persistent=False,
+            )
 
         # ------------------------------------------------------------------ #
         # Tier 2a — Multi-layer input embedding (V-JEPA 2.1 hierarchical)
@@ -201,6 +227,27 @@ class CameraConditionedPredictorAC(nn.Module):
                 [nn.Linear(predictor_embed_dim, out_embed_dim, bias=True) for _ in range(n_hierarchical_layers)]
             )
 
+        if self.use_delta_head:
+            self.predictor_proj_delta = nn.ModuleList(
+                [nn.Linear(predictor_embed_dim, out_embed_dim, bias=True) for _ in range(n_hierarchical_layers)]
+            )
+
+        if self.use_residual_head:
+            residual_hidden = int(predictor_embed_dim * residual_head_ratio)
+            layers = []
+            in_dim = predictor_embed_dim
+            for _ in range(residual_head_depth):
+                layers.extend(
+                    [
+                        nn.Linear(in_dim, residual_hidden, bias=True),
+                        nn.GELU(),
+                    ]
+                )
+                in_dim = residual_hidden
+            layers.append(nn.Linear(in_dim, predictor_embed_dim, bias=True))
+            self.residual_refine = nn.Sequential(*layers)
+            self.residual_gate = nn.Parameter(torch.tensor(0.01))
+
         # ------------------------------------------------------------------ #
         # Weight initialisation + block rescaling (mirrors ac_predictor.py)
         # ------------------------------------------------------------------ #
@@ -243,6 +290,40 @@ class CameraConditionedPredictorAC(nn.Module):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
+    def _compute_ray_pe(self, intrinsics, states, B, T, D):
+        """
+        Compute per-patch ray direction in anchor-local frame.
+
+        Args:
+            intrinsics: [B, T, 4] normalised [fx/W, fy/H, cx/W, cy/H]
+            states: [B, T, 7] anchor-local pose [tx, ty, tz, qx, qy, qz, qw]
+
+        Returns:
+            [B, T, H*W, D] ray embeddings to add to patch tokens.
+        """
+        del B, D
+
+        hw = self.grid_height * self.grid_width
+        pixel_grid = self._ray_pixel_grid.to(device=intrinsics.device, dtype=intrinsics.dtype)
+        px = pixel_grid[:, 0]
+        py = pixel_grid[:, 1]
+
+        fx = intrinsics[:, :, 0:1]
+        fy = intrinsics[:, :, 1:2]
+        cx = intrinsics[:, :, 2:3]
+        cy = intrinsics[:, :, 3:4]
+
+        ray_x = (px.unsqueeze(0).unsqueeze(0) - cx) / (fx + 1.0e-8)
+        ray_y = (py.unsqueeze(0).unsqueeze(0) - cy) / (fy + 1.0e-8)
+        ray_z = torch.ones_like(ray_x)
+
+        ray_dir = torch.stack([ray_x, ray_y, ray_z], dim=-1)
+        ray_dir = ray_dir / (ray_dir.norm(dim=-1, keepdim=True) + 1.0e-8)
+
+        ray_origin = states[:, :, :3].unsqueeze(2).expand(-1, T, hw, -1)
+        ray_feat = torch.cat([ray_origin, ray_dir], dim=-1)
+        return self.ray_pe_mlp(ray_feat)
+
     # ---------------------------------------------------------------------- #
     # Forward
     # ---------------------------------------------------------------------- #
@@ -266,11 +347,19 @@ class CameraConditionedPredictorAC(nn.Module):
             context_predictions: Projected context-token predictions (only if
                predict_all=True, else None).
                Shape: [B, T * H * W, n_hierarchical_layers * out_embed_dim].
+            delta_predictions: Projected delta predictions (only if
+               use_delta_head=True, else None).
+               Shape: [B, T * H * W, n_hierarchical_layers * out_embed_dim].
         """
         # -- project visual tokens to predictor dimension
         x = self.predictor_embed(x)
         B, N_ctxt, D = x.size()
         T = N_ctxt // (self.grid_height * self.grid_width)
+
+        if self.use_ray_pe and intrinsics is not None:
+            ray_embed = self._compute_ray_pe(intrinsics, states, B, T, D)
+            x_with_ray = x.view(B, T, self.grid_height * self.grid_width, D)
+            x = (x_with_ray + ray_embed).flatten(1, 2)
 
         # -- encode camera conditioning tokens → [B, T, 1, D] each
         a = self.action_encoder(actions).unsqueeze(2)    # [B, T, 1, D]
@@ -289,7 +378,9 @@ class CameraConditionedPredictorAC(nn.Module):
 
         # -- slice causal mask to actual sequence length
         seq_len = x_seq.size(1)
-        attn_mask = self.attn_mask[:seq_len, :seq_len].to(x_seq.device, non_blocking=True)
+        attn_mask = None
+        if self.attn_mask is not None:
+            attn_mask = self.attn_mask[:seq_len, :seq_len].to(x_seq.device, non_blocking=True).clone()
 
         # -- transformer forward pass
         for blk in self.predictor_blocks:
@@ -298,7 +389,7 @@ class CameraConditionedPredictorAC(nn.Module):
                     blk,
                     x_seq,
                     None,           # mask
-                    attn_mask,
+                    attn_mask.clone() if attn_mask is not None else None,
                     T,
                     self.grid_height,
                     self.grid_width,
@@ -323,12 +414,20 @@ class CameraConditionedPredictorAC(nn.Module):
         x_visual = self.predictor_norm(x_visual)
 
         predictions = torch.cat([head(x_visual) for head in self.predictor_proj], dim=-1)
+        if self.use_residual_head:
+            refine = self.residual_refine(x_visual)
+            x_visual_refined = x_visual + self.residual_gate * refine
+            predictions = torch.cat([head(x_visual_refined) for head in self.predictor_proj], dim=-1)
 
+        context_predictions = None
         if self.predict_all:
             context_predictions = torch.cat([head(x_visual) for head in self.predictor_proj_context], dim=-1)
-            return predictions, context_predictions
 
-        return predictions, None
+        delta_predictions = None
+        if self.use_delta_head:
+            delta_predictions = torch.cat([head(x_visual) for head in self.predictor_proj_delta], dim=-1)
+
+        return predictions, context_predictions, delta_predictions
 
 
 def vit_camera_ac_predictor(**kwargs):

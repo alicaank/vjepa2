@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 import sys
 
 import torch
@@ -15,6 +16,51 @@ from src.utils.schedulers import CosineWDSchedule, WSDSchedule
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
+
+
+def _env_bool(name, default):
+    """Parse a boolean environment variable. Only override when explicitly set."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int_list(name):
+    """Parse a comma-separated integer list from an env var.
+
+    Returns ``None`` when the variable is unset / empty / invalid, signalling
+    the caller should fall back to the default layer-selection policy.
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        values = [int(part.strip()) for part in str(raw).split(",") if part.strip()]
+    except ValueError:
+        logger.warning(f"Ignoring malformed {name}={raw!r}; expected comma-separated ints")
+        return None
+    return values or None
 
 
 def _upgrade_camera_predictor_state_dict(pretrained_dict, model):
@@ -122,6 +168,27 @@ def load_checkpoint(
             pretrained_dict = _upgrade_camera_predictor_state_dict(pretrained_dict, model)
         msg = model.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded {key} from epoch {epoch} with msg: {msg}")
+        # Fail loud when the live predictor is missing experiment-flag submodules
+        # present in the checkpoint. Silent drops invalidate ablation metrics.
+        if key == "predictor":
+            unexpected = list(getattr(msg, "unexpected_keys", []) or [])
+            flag_prefixes = (
+                "ray_pe_mlp.",
+                "predictor_proj_delta.",
+                "residual_refine.",
+                "residual_gate",
+            )
+            leaked = [k for k in unexpected if any(k.startswith(p) for p in flag_prefixes)]
+            if leaked:
+                raise RuntimeError(
+                    "Predictor checkpoint contains experiment-flag weights that "
+                    "are not present in the live model: "
+                    f"{leaked}. The predictor was built without the matching "
+                    "USE_RAY_PE / USE_DELTA_HEAD / USE_RESIDUAL_HEAD flags. "
+                    "Set the corresponding environment variable (or kwarg) so "
+                    "init_video_model instantiates the right modules before "
+                    "loading this checkpoint."
+                )
 
     if opt is not None:
         opt_state = checkpoint.get("opt")
@@ -166,7 +233,32 @@ def init_video_model(
     intrinsics_dim=4,
     use_intrinsics=True,
     predict_all=True,
+    use_ray_pe=False,
+    ray_pe_dim=6,
+    ray_pe_hidden=256,
+    use_delta_head=False,
+    use_residual_head=False,
+    residual_head_depth=2,
+    residual_head_ratio=2.0,
 ):
+    # Ablation-flag env-var fallback. Callers that do not explicitly pass the
+    # experiment flags (e.g. the rollout eval tool) still build the correct
+    # predictor when USE_RAY_PE / USE_DELTA_HEAD / USE_RESIDUAL_HEAD are set
+    # by the orchestration shell script. Explicit True kwargs are never demoted.
+    use_ray_pe = bool(use_ray_pe) or _env_bool("USE_RAY_PE", False)
+    ray_pe_dim = _env_int("RAY_PE_DIM", ray_pe_dim)
+    ray_pe_hidden = _env_int("RAY_PE_HIDDEN", ray_pe_hidden)
+    use_delta_head = bool(use_delta_head) or _env_bool("USE_DELTA_HEAD", False)
+    use_residual_head = bool(use_residual_head) or _env_bool("USE_RESIDUAL_HEAD", False)
+    residual_head_depth = _env_int("RESIDUAL_HEAD_DEPTH", residual_head_depth)
+    residual_head_ratio = _env_float("RESIDUAL_HEAD_RATIO", residual_head_ratio)
+    logger.info(
+        "init_video_model experiment flags: "
+        f"use_ray_pe={use_ray_pe} (dim={ray_pe_dim}, hidden={ray_pe_hidden}) "
+        f"use_delta_head={use_delta_head} "
+        f"use_residual_head={use_residual_head} (depth={residual_head_depth}, ratio={residual_head_ratio})"
+    )
+
     # Build the encoder.  We instantiate it first without out_layers to read
     # the total block depth, then reinitialise with the last n_hierarchical_layers.
     _enc_tmp = video_vit.__dict__[model_name](
@@ -177,8 +269,34 @@ def init_video_model(
     )
     n_blocks = len(_enc_tmp.blocks)
     del _enc_tmp
-    # Collect the last n_hierarchical_layers block indices
-    out_layers = list(range(n_blocks - n_hierarchical_layers, n_blocks))
+    # Layer-selection policy.
+    #   * Default: the last n_hierarchical_layers consecutive blocks
+    #     (original V-JEPA 2.1 camera-predictor convention).
+    #   * Override: set VJEPA_OUT_LAYERS="11,23,35,47" (or any comma-separated
+    #     list) to pick explicit block indices — e.g. evenly-spaced taps that
+    #     match the decoder's hierarchical-feature contract for 48-layer
+    #     gigantic encoders. The list length MUST equal n_hierarchical_layers
+    #     because the predictor splits its per-layer feature dim by that count
+    #     (see ``_sample_latent_loss`` / loss_fn in train.py).
+    out_layers_override = _env_int_list("VJEPA_OUT_LAYERS")
+    if out_layers_override is not None:
+        if len(out_layers_override) != n_hierarchical_layers:
+            raise ValueError(
+                f"VJEPA_OUT_LAYERS has {len(out_layers_override)} entries "
+                f"({out_layers_override}) but n_hierarchical_layers={n_hierarchical_layers}. "
+                f"They must match because the predictor splits target features by this count."
+            )
+        for idx in out_layers_override:
+            if idx < 0 or idx >= n_blocks:
+                raise ValueError(
+                    f"VJEPA_OUT_LAYERS index {idx} is out of range for an encoder "
+                    f"with {n_blocks} blocks (valid: 0..{n_blocks - 1})."
+                )
+        out_layers = list(out_layers_override)
+        logger.info(f"Using VJEPA_OUT_LAYERS override: {out_layers} (n_blocks={n_blocks})")
+    else:
+        out_layers = list(range(n_blocks - n_hierarchical_layers, n_blocks))
+        logger.info(f"Using default last-{n_hierarchical_layers} out_layers: {out_layers} (n_blocks={n_blocks})")
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,
@@ -217,6 +335,13 @@ def init_video_model(
         intrinsics_dim=intrinsics_dim,
         use_intrinsics=use_intrinsics,
         predict_all=predict_all,
+        use_ray_pe=use_ray_pe,
+        ray_pe_dim=ray_pe_dim,
+        ray_pe_hidden=ray_pe_hidden,
+        use_delta_head=use_delta_head,
+        use_residual_head=use_residual_head,
+        residual_head_depth=residual_head_depth,
+        residual_head_ratio=residual_head_ratio,
     )
 
     encoder.to(device)

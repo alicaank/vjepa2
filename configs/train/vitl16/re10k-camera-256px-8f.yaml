@@ -16,6 +16,7 @@ data:
   stride_values: [1, 2, 4, 8]
   n_ctx_tubelets: 1   # tubelets shown to context encoder; predictor predicts the rest
   ar_random_context: true
+  ar_random_local_window: false
   min_ctx_tubelets: 1
   max_ctx_tubelets: 3
   n_motion_eval_scenes: 64
@@ -30,6 +31,8 @@ loss:
   loss_exp: 1.0
   normalize_reps: true
   context_loss_weight: 0.0
+  rollout_train_steps: 1
+  rollout_loss_decay: 0.5
 meta:
   dtype: bfloat16
   resume_checkpoint: null
@@ -40,6 +43,7 @@ meta:
   context_encoder_key: ema_encoder
   target_encoder_key: ema_encoder
   save_every_freq: 10
+  checkpoint_save_mode: weights_only_no_target
   seed: 42
   use_sdpa: true
   sync_gc: false
@@ -63,6 +67,14 @@ model:
   intrinsics_dim: 4   # normalised [fx/W, fy/H, cx/W, cy/H]
   use_intrinsics: true
   predict_all: false
+  use_ray_pe: false
+  ray_pe_dim: 6
+  ray_pe_hidden: 256
+  use_delta_head: false
+  delta_loss_weight: 0.25
+  use_residual_head: false
+  residual_head_depth: 2
+  residual_head_ratio: 2.0
 optimization:
   anneal: 15
   epochs: 50
