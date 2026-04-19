@@ -290,13 +290,42 @@ class CameraConditionedPredictorAC(nn.Module):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
-    def _compute_ray_pe(self, intrinsics, states, B, T, D):
-        """
-        Compute per-patch ray direction in anchor-local frame.
+    @staticmethod
+    def _quat_xyzw_to_rotmat(q: torch.Tensor) -> torch.Tensor:
+        """Convert a (qx, qy, qz, qw) quaternion to a rotation matrix.
 
         Args:
-            intrinsics: [B, T, 4] normalised [fx/W, fy/H, cx/W, cy/H]
-            states: [B, T, 7] anchor-local pose [tx, ty, tz, qx, qy, qz, qw]
+            q: [..., 4] quaternion in xyzw order (matches the state layout
+                produced by RE10KSequenceDataset).
+
+        Returns:
+            [..., 3, 3] rotation matrix that maps vectors from camera-local
+            coordinates into the anchor-canonicalized frame.
+        """
+        q = torch.nn.functional.normalize(q, dim=-1, eps=1.0e-8)
+        x, y, z, w = q.unbind(dim=-1)
+        ww, xx, yy, zz = w * w, x * x, y * y, z * z
+        wx, wy, wz = w * x, w * y, w * z
+        xy, xz, yz = x * y, x * z, y * z
+        row0 = torch.stack([ww + xx - yy - zz, 2.0 * (xy - wz),       2.0 * (xz + wy)],       dim=-1)
+        row1 = torch.stack([2.0 * (xy + wz),   ww - xx + yy - zz,     2.0 * (yz - wx)],       dim=-1)
+        row2 = torch.stack([2.0 * (xz - wy),   2.0 * (yz + wx),       ww - xx - yy + zz],     dim=-1)
+        return torch.stack([row0, row1, row2], dim=-2)
+
+    def _compute_ray_pe(self, intrinsics, states, B, T, D):
+        """
+        Compute per-patch Plücker-style ray embedding in the anchor frame.
+
+        The intrinsics produce a per-patch direction in *camera-local*
+        coordinates. Before concatenating with the translation (which is
+        already in the anchor-canonicalized frame, see
+        ``_canonicalize_states`` in train.py), the direction is rotated
+        into the anchor frame by the per-frame quaternion so origin and
+        direction live in a consistent coordinate system.
+
+        Args:
+            intrinsics: [B, T, 4] normalised [fx/W, fy/H, cx/W, cy/H].
+            states: [B, T, 7] anchor-local pose [tx, ty, tz, qx, qy, qz, qw].
 
         Returns:
             [B, T, H*W, D] ray embeddings to add to patch tokens.
@@ -317,10 +346,17 @@ class CameraConditionedPredictorAC(nn.Module):
         ray_y = (py.unsqueeze(0).unsqueeze(0) - cy) / (fy + 1.0e-8)
         ray_z = torch.ones_like(ray_x)
 
-        ray_dir = torch.stack([ray_x, ray_y, ray_z], dim=-1)
-        ray_dir = ray_dir / (ray_dir.norm(dim=-1, keepdim=True) + 1.0e-8)
+        ray_dir_cam = torch.stack([ray_x, ray_y, ray_z], dim=-1)                    # [B, T, HW, 3]
+        ray_dir_cam = ray_dir_cam / (ray_dir_cam.norm(dim=-1, keepdim=True) + 1.0e-8)
 
-        ray_origin = states[:, :, :3].unsqueeze(2).expand(-1, T, hw, -1)
+        # Rotate camera-local direction into the anchor frame using the
+        # per-frame quaternion.  The translation already lives in anchor
+        # coordinates, so after this step (origin, direction) form a
+        # geometrically consistent ray.
+        R = self._quat_xyzw_to_rotmat(states[:, :, 3:7].to(dtype=ray_dir_cam.dtype))  # [B, T, 3, 3]
+        ray_dir = torch.einsum("btij,bthj->bthi", R, ray_dir_cam)                   # [B, T, HW, 3]
+
+        ray_origin = states[:, :, :3].to(dtype=ray_dir.dtype).unsqueeze(2).expand(-1, -1, hw, -1)
         ray_feat = torch.cat([ray_origin, ray_dir], dim=-1)
         return self.ray_pe_mlp(ray_feat)
 
@@ -355,6 +391,14 @@ class CameraConditionedPredictorAC(nn.Module):
         x = self.predictor_embed(x)
         B, N_ctxt, D = x.size()
         T = N_ctxt // (self.grid_height * self.grid_width)
+
+        if self.use_intrinsics and intrinsics is None:
+            raise ValueError(
+                "CameraConditionedPredictorAC was built with use_intrinsics=True "
+                "but forward() received intrinsics=None. The attention mask and "
+                "post-block reshape assume cond_tokens=3; passing None would "
+                "silently drop the K slot and break the sequence layout."
+            )
 
         if self.use_ray_pe and intrinsics is not None:
             ray_embed = self._compute_ray_pe(intrinsics, states, B, T, D)
@@ -413,19 +457,25 @@ class CameraConditionedPredictorAC(nn.Module):
         x_visual = x_seq[:, :, self.cond_tokens:, :].flatten(1, 2)   # [B, T*H*W, D]
         x_visual = self.predictor_norm(x_visual)
 
-        predictions = torch.cat([head(x_visual) for head in self.predictor_proj], dim=-1)
+        # Residual head (optional) refines `x_visual` before it feeds every
+        # output projection. Sharing the refined features across the primary,
+        # context, and delta heads keeps the three outputs consistent; earlier
+        # revisions projected `x_visual` twice in the `use_residual_head=True`
+        # path (once wasted) and fed the unrefined tensor to the context/delta
+        # heads, producing a silent asymmetry between the heads.
+        head_input = x_visual
         if self.use_residual_head:
-            refine = self.residual_refine(x_visual)
-            x_visual_refined = x_visual + self.residual_gate * refine
-            predictions = torch.cat([head(x_visual_refined) for head in self.predictor_proj], dim=-1)
+            head_input = x_visual + self.residual_gate * self.residual_refine(x_visual)
+
+        predictions = torch.cat([head(head_input) for head in self.predictor_proj], dim=-1)
 
         context_predictions = None
         if self.predict_all:
-            context_predictions = torch.cat([head(x_visual) for head in self.predictor_proj_context], dim=-1)
+            context_predictions = torch.cat([head(head_input) for head in self.predictor_proj_context], dim=-1)
 
         delta_predictions = None
         if self.use_delta_head:
-            delta_predictions = torch.cat([head(x_visual) for head in self.predictor_proj_delta], dim=-1)
+            delta_predictions = torch.cat([head(head_input) for head in self.predictor_proj_delta], dim=-1)
 
         return predictions, context_predictions, delta_predictions
 

@@ -12,6 +12,7 @@
 #   4. Compute V-JEPA 2.1 hierarchical dense predictive loss
 
 import json
+import logging
 import os
 import glob
 import copy
@@ -21,6 +22,7 @@ import shutil
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -32,7 +34,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from app.vjepa_camera_re10k.utils import (
-    encode_clip_as_images,
     init_opt,
     init_video_model,
     load_checkpoint,
@@ -48,6 +49,8 @@ CHECKPOINT_FREQ = 10
 VIZ_FREQ = 10
 GARBAGE_COLLECT_ITR_FREQ = 50
 MIN_FREE_BYTES_FOR_FULL_CHECKPOINT = 6 * 1024**3
+CHECKPOINT_SAVE_BUFFER_BYTES = 4 * 1024**3
+FULL_CHECKPOINT_SIZE_SAFETY_FACTOR = 1.10
 
 _GLOBAL_SEED = 0
 random.seed(_GLOBAL_SEED)
@@ -302,6 +305,15 @@ def main(args, resume_preempt=False):
     cfgs_loss = args.get("loss")
     loss_exp = cfgs_loss.get("loss_exp", 1.0)
     normalize_reps = cfgs_loss.get("normalize_reps", True)
+    # Per-layer balance rescales each hierarchical chunk's L1 contribution by
+    # the target chunk's std. This compensates for the gradient imbalance
+    # across hierarchical layers that appears once LayerNorm is removed from
+    # the loss (normalize_reps=False): without rescaling, high-magnitude deep
+    # layers dominate and early layers are effectively untrained. Default
+    # tracks normalize_reps — on when LN is off, off when LN is on.
+    per_layer_balance = bool(
+        cfgs_loss.get("per_layer_balance", not normalize_reps)
+    )
     rollout_train_steps = max(1, int(cfgs_loss.get("rollout_train_steps", 1)))
     rollout_loss_decay = float(cfgs_loss.get("rollout_loss_decay", 0.5))
     rollout_train_steps = min(rollout_train_steps, max_valid_ctx_tubelets)
@@ -339,6 +351,11 @@ def main(args, resume_preempt=False):
 
     world_size, rank = init_distributed()
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
+    # Silence non-rank-0 loggers to cut the duplicate per-rank log spam
+    # (model repr, init banners, dataset indexing, stats). Set
+    # VJEPA_LOG_ALL_RANKS=1 to restore full per-rank logging.
+    if rank != 0 and os.environ.get("VJEPA_LOG_ALL_RANKS", "0") != "1":
+        logging.getLogger().setLevel(logging.WARNING)
 
     if not torch.cuda.is_available():
         device = torch.device("cpu")
@@ -533,6 +550,32 @@ def main(args, resume_preempt=False):
     for p in target_encoder.parameters():
         p.requires_grad = False
 
+    # Paper-faithful V-JEPA 2-AC: when the context-encoder LR scale is 0 we
+    # also disable its gradients so the backward pass actually skips the
+    # encoder (~30% step-time reduction + encoder-sized gradient VRAM saved).
+    # Without this guard AdamW would still compute encoder grads and then
+    # zero-update them — wasteful.
+    context_encoder_frozen = float(enc_lr_scale) <= 0.0
+    if context_encoder_frozen:
+        for p in encoder.parameters():
+            p.requires_grad = False
+        # eval() disables dropout / stochastic-depth inside ViT blocks so
+        # context features are deterministic — matches the target encoder
+        # regime and guarantees context == target outputs at init (paper
+        # figure's identical "frozen encoder" boxes).
+        encoder.eval()
+        logger.info(
+            "Context encoder frozen (enc_lr_scale=%.3f <= 0): "
+            "parameters set requires_grad=False and module.eval() called.",
+            float(enc_lr_scale),
+        )
+
+    logger.info(
+        "Loss config: normalize_reps=%s, per_layer_balance=%s, loss_exp=%.3f, "
+        "rollout_train_steps=%d.",
+        normalize_reps, per_layer_balance, float(loss_exp), rollout_train_steps,
+    )
+
     # -- load pretrained encoder weights
     encoder, predictor, target_encoder = load_pretrained(
         r_path=p_file,
@@ -598,6 +641,29 @@ def main(args, resume_preempt=False):
         target_path = path if os.path.exists(path) else (os.path.dirname(path) or ".")
         return shutil.disk_usage(target_path).free
 
+    def _recursive_tensor_nbytes(obj):
+        if torch.is_tensor(obj):
+            return obj.numel() * obj.element_size()
+        if isinstance(obj, dict):
+            return sum(_recursive_tensor_nbytes(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return sum(_recursive_tensor_nbytes(v) for v in obj)
+        return 0
+
+    def _estimate_full_checkpoint_required_bytes():
+        # Estimate serialized payload size from live model/optimizer tensors,
+        # then add safety margin + free-space buffer for tmp-file staging.
+        model_bytes = (
+            _recursive_tensor_nbytes(encoder.state_dict())
+            + _recursive_tensor_nbytes(predictor.state_dict())
+            + _recursive_tensor_nbytes(target_encoder.state_dict())
+        )
+        optimizer_bytes = _recursive_tensor_nbytes(getattr(optimizer, "state", {}))
+        scaler_state = None if scaler is None else scaler.state_dict()
+        scaler_bytes = _recursive_tensor_nbytes(scaler_state)
+        payload_bytes = model_bytes + optimizer_bytes + scaler_bytes
+        return int(payload_bytes * FULL_CHECKPOINT_SIZE_SAFETY_FACTOR) + CHECKPOINT_SAVE_BUFFER_BYTES
+
     def _compact_state_dict(state_dict):
         compact_state = {}
         for key, value in state_dict.items():
@@ -614,25 +680,22 @@ def main(args, resume_preempt=False):
         if pip_cache_dir:
             _remove_tree(pip_cache_dir)
             os.makedirs(pip_cache_dir, exist_ok=True)
-        pretrained_cache_path = None
-        if isinstance(p_file, str) and p_file:
-            if os.path.isfile(p_file):
-                pretrained_cache_path = p_file
-            elif p_file.startswith(("https://", "http://")):
-                torch_home = os.environ.get("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
-                pretrained_cache_path = os.path.join(torch_home, "hub", "checkpoints", os.path.basename(p_file))
-        if pretrained_cache_path is not None:
-            resume_abs = os.path.abspath(resume_path) if resume_path is not None else None
-            if resume_abs is None or os.path.abspath(pretrained_cache_path) != resume_abs:
-                _remove_file(pretrained_cache_path)
+        # Keep prewarmed pretrained checkpoints in TORCH_HOME between ablations.
+        # Deleting them here causes later experiments in the same job to fail.
+
+    def _unwrapped_state_dict(m):
+        """Return state_dict of a possibly DDP-wrapped module WITHOUT the
+        ``module.`` prefix. Checkpoints must be portable to single-GPU
+        subprocesses (e.g. rollout eval) which build an unwrapped model."""
+        return (m.module if hasattr(m, "module") else m).state_dict()
 
     def _build_full_checkpoint_payload(epoch):
         return {
-            "encoder": encoder.state_dict(),
-            "predictor": predictor.state_dict(),
+            "encoder": _unwrapped_state_dict(encoder),
+            "predictor": _unwrapped_state_dict(predictor),
             "opt": optimizer.state_dict(),
             "scaler": None if scaler is None else scaler.state_dict(),
-            "target_encoder": target_encoder.state_dict(),
+            "target_encoder": _unwrapped_state_dict(target_encoder),
             "epoch": epoch,
             "loss": loss_meter.avg,
             "batch_size": batch_size,
@@ -643,8 +706,8 @@ def main(args, resume_preempt=False):
 
     def _build_weights_only_payload(epoch, *, include_target_encoder):
         payload = {
-            "encoder": _compact_state_dict(encoder.state_dict()),
-            "predictor": _compact_state_dict(predictor.state_dict()),
+            "encoder": _compact_state_dict(_unwrapped_state_dict(encoder)),
+            "predictor": _compact_state_dict(_unwrapped_state_dict(predictor)),
             "epoch": epoch,
             "loss": loss_meter.avg,
             "batch_size": batch_size,
@@ -653,7 +716,7 @@ def main(args, resume_preempt=False):
             "checkpoint_type": "weights_only_bf16",
         }
         if include_target_encoder:
-            payload["target_encoder"] = _compact_state_dict(target_encoder.state_dict())
+            payload["target_encoder"] = _compact_state_dict(_unwrapped_state_dict(target_encoder))
         return payload
 
     def _write_checkpoint_payload(payload, path, *, tag):
@@ -761,13 +824,23 @@ def main(args, resume_preempt=False):
                 tag="weights-only-bf16-no-target",
             )
         free_bytes = _free_bytes(checkpoint_stage_dir)
-        if checkpoint_save_mode == "full" or free_bytes >= MIN_FREE_BYTES_FOR_FULL_CHECKPOINT:
+        full_required_bytes = max(
+            MIN_FREE_BYTES_FOR_FULL_CHECKPOINT,
+            _estimate_full_checkpoint_required_bytes(),
+        )
+        if free_bytes >= full_required_bytes:
             if _write_checkpoint_payload(_build_full_checkpoint_payload(epoch), path, tag="full"):
                 return True
             logger.warning("Full checkpoint save failed; falling back to weights-only checkpoint.")
         else:
+            if checkpoint_save_mode == "full":
+                logger.warning(
+                    f"Requested full checkpoint but only {free_bytes / 1024.0**3:.2f} GiB free in {checkpoint_stage_dir}; "
+                    f"need about {full_required_bytes / 1024.0**3:.2f} GiB. Falling back to compact checkpoint."
+                )
             logger.warning(
                 f"Only {free_bytes / 1024.0**3:.2f} GiB free in {checkpoint_stage_dir}; "
+                f"full checkpoint needs about {full_required_bytes / 1024.0**3:.2f} GiB. "
                 "saving compact weights-only checkpoint instead of full checkpoint."
             )
         if _write_checkpoint_payload(
@@ -838,8 +911,15 @@ def main(args, resume_preempt=False):
                 if normalize_reps:
                     p = F.layer_norm(p, (p.size(-1),))
                     t = F.layer_norm(t, (t.size(-1),))
+                if per_layer_balance:
+                    # Rescale by target std so each layer's L1 contribution is
+                    # dimensionless and equally weighted across hierarchical
+                    # chunks. No-op when normalize_reps=True (std≈1 after LN).
+                    scale = t.detach().std().clamp_min(1.0e-6)
+                else:
+                    scale = 1.0
                 loss_pred = loss_pred + (
-                    torch.mean(torch.abs(p - t) ** loss_exp) / loss_exp
+                    torch.mean(torch.abs(p - t) ** loss_exp) / loss_exp / scale
                 )
             loss_pred = loss_pred / n_hierarchical_layers
             return float(loss_pred.item())
@@ -943,7 +1023,10 @@ def main(args, resume_preempt=False):
             v_actions = eval_sample["actions"].to(device, dtype=torch.float)[:, ::tubelet_size]
             v_intrinsics = eval_sample["intrinsics"].to(device, dtype=torch.float)[:, ::tubelet_size]
             full_clip = v_imgs.permute(0, 2, 1, 3, 4)
-            layer_outs = encode_clip_as_images(_enc, full_clip)
+            # Video path: tubelet_size=2 fuses frame pairs via patch_embed's
+            # 3D conv, returning per-layer (B, T_tok*HW, D) tensors where
+            # T_tok = T/tubelet_size. Matches final_rollout.pt training regime.
+            layer_outs = _enc(full_clip)
             h_tgt_full = _layerlist_to_h_eval(layer_outs)
             h_tgt = h_tgt_full[0]
             layer_dim = layer_outs[-1].shape[-1]
@@ -953,7 +1036,7 @@ def main(args, resume_preempt=False):
             h_tgt_last = h_tgt[target_start:target_end, -layer_dim:]
             h_tgt_eval = h_tgt_full[:, target_start:target_end, :]
             ctx_clip = v_imgs[:, :ctx_frames_eval].permute(0, 2, 1, 3, 4)
-            ctx_lo = encode_clip_as_images(_enc, ctx_clip)
+            ctx_lo = _enc(ctx_clip)
             h_ctx = torch.cat(ctx_lo, dim=-1)
             B_v = h_ctx.shape[0]
             future_tokens_v = _pred.future_mask_token.to(device=device, dtype=h_ctx.dtype).expand(
@@ -1072,11 +1155,171 @@ def main(args, resume_preempt=False):
         except Exception as e:
             logger.warning(f"Failed to write eval summary to {eval_summary_path}: {e}")
 
+        # ------------------------------------------------------------------
+        # Mirror eval scalars into training_stats so plot_training_curves
+        # renders them alongside train losses. Unknown keys are auto-plotted
+        # by src/training/visualization.py (future-proofing branch).
+        # ------------------------------------------------------------------
+        def _bin_loss(bin_summary, bin_name):
+            if bin_summary is None:
+                return None
+            bins = bin_summary.get("bins", {}) if isinstance(bin_summary, dict) else {}
+            entry = bins.get(bin_name)
+            if not isinstance(entry, dict):
+                return None
+            val = entry.get("loss")
+            return float(val) if isinstance(val, (int, float)) else None
+
+        if motion_eval_losses:
+            training_stats.setdefault("eval_motion_mean_loss", []).append(
+                float(np.mean(motion_eval_losses))
+            )
+        for bin_name in ("low", "medium", "high"):
+            t_val = _bin_loss(translation_summary, bin_name)
+            r_val = _bin_loss(rotation_summary, bin_name)
+            if t_val is not None:
+                training_stats.setdefault(f"eval_motion_trans_{bin_name}", []).append(t_val)
+            if r_val is not None:
+                training_stats.setdefault(f"eval_motion_rot_{bin_name}", []).append(r_val)
+        for stride_label, stride_entry in eval_summary.get("fixed_stride", {}).items():
+            if not isinstance(stride_entry, dict):
+                continue
+            loss_val = stride_entry.get("loss")
+            if isinstance(loss_val, (int, float)):
+                training_stats.setdefault(f"eval_fixed_stride_{stride_label}", []).append(float(loss_val))
+
+        # Re-plot the curves now that the eval series have been updated, so
+        # the current epoch's PNG actually reflects this epoch's eval point.
+        try:
+            plot_training_curves(training_stats, curve_path)
+        except Exception as _ce:
+            logger.warning(f"Training curves refresh (with eval) failed: {_ce}")
+
         if pca_outputs_written > 0:
             _prune_pca_outputs(epoch)
             logger.info(f"PCA visualisations saved to {pca_vis_dir}")
         else:
             logger.warning("No PCA visualisations were written; keeping previous PCA outputs.")
+
+        # ------------------------------------------------------------------ #
+        # In-process camera rollout eval (replaces the 3× cold-start
+        # ``run_rollout_evals`` loop in scripts/train_camera_re10k.sh).
+        # Enabled by setting CAMERA_ROLLOUT_EVAL_HORIZONS (e.g. "5,12,20").
+        # One rollout at max(horizons) yields per-horizon summaries as
+        # prefixes — so 3 legacy horizons cost one forward pass with the
+        # already-loaded encoder/predictor (zero weight reload).
+        # ------------------------------------------------------------------ #
+        _horizons_env = os.environ.get("CAMERA_ROLLOUT_EVAL_HORIZONS", "").strip()
+        if _horizons_env:
+            try:
+                horizons_list = [int(h) for h in _horizons_env.split(",") if h.strip()]
+            except ValueError as _he:
+                logger.warning(f"Ignoring CAMERA_ROLLOUT_EVAL_HORIZONS={_horizons_env!r}: {_he}")
+                horizons_list = []
+            if horizons_list:
+                try:
+                    # Closure-captured from the outer function; NameError if the
+                    # eval loader init block above failed (then we skip).
+                    _lazy_ref = _eval_lazy  # noqa: F821 -- captured via closure
+                    _gwm_root_ref = gwm_root  # noqa: F821 -- captured via closure
+                    tools_dir = os.path.join(_gwm_root_ref, "tools")
+                    if tools_dir not in sys.path:
+                        sys.path.insert(0, tools_dir)
+                    from camera_rollout_pca import (
+                        build_rollout_datasets_from_lazy,
+                        run_rollout_eval_inprocess,
+                    )
+
+                    max_horizon = max(horizons_list)
+                    # Seed context for the rollout = max_ctx_tubelets (same as
+                    # the tool's default); guard against running off the end.
+                    seed_tubelets_eval = max(1, min(max_ctx_tubelets, total_tubelets - 1))
+                    context_tubelets_eval = max(1, min(n_ctx_tubelets, seed_tubelets_eval))
+                    rollout_seq_len = tubelet_size * (seed_tubelets_eval + max_horizon)
+                    one_step_seq_len = tubelet_size * (context_tubelets_eval + 1)
+
+                    rollout_ds = build_rollout_datasets_from_lazy(
+                        lazy_dataset=_lazy_ref, seq_len=rollout_seq_len,
+                        stride=stride, min_stride=min_stride, stride_values=stride_values,
+                        image_size=crop_size,
+                    )
+                    one_step_ds = build_rollout_datasets_from_lazy(
+                        lazy_dataset=_lazy_ref, seq_len=one_step_seq_len,
+                        stride=stride, min_stride=min_stride, stride_values=stride_values,
+                        image_size=crop_size,
+                    )
+                    fixed_stride_datasets = {
+                        label: build_rollout_datasets_from_lazy(
+                            lazy_dataset=_lazy_ref, seq_len=one_step_seq_len,
+                            stride=sv, min_stride=sv, stride_values=[sv],
+                            image_size=crop_size,
+                        )
+                        for label, sv in [
+                            ("small", eval_stride_small),
+                            ("medium", eval_stride_medium),
+                            ("large", eval_stride_large),
+                        ]
+                    }
+
+                    rollout_out_dir = Path(folder) / f"rollout_eval_e{epoch:03d}"
+                    _enc_unwrapped = encoder.module if hasattr(encoder, "module") else encoder
+                    _pred_unwrapped = predictor.module if hasattr(predictor, "module") else predictor
+                    _tgt_unwrapped = target_encoder.module if hasattr(target_encoder, "module") else target_encoder
+                    dtype_name_eval = (
+                        "bfloat16"
+                        if getattr(torch, "get_autocast_gpu_dtype", lambda: torch.bfloat16)() is torch.bfloat16
+                        else "float16"
+                    )
+
+                    rollout_summary = run_rollout_eval_inprocess(
+                        encoder=_enc_unwrapped,
+                        predictor=_pred_unwrapped,
+                        target_encoder=_tgt_unwrapped,
+                        rollout_ds=rollout_ds,
+                        one_step_ds=one_step_ds,
+                        fixed_stride_datasets=fixed_stride_datasets,
+                        device=device,
+                        output_dir=rollout_out_dir,
+                        horizons=horizons_list,
+                        n_scenes=max(1, n_pca_scenes),
+                        scene_start_index=0,
+                        context_tubelets=context_tubelets_eval,
+                        seed_tubelets=seed_tubelets_eval,
+                        tubelet_size=tubelet_size,
+                        crop_size=crop_size,
+                        patch_size=patch_size,
+                        n_hierarchical_layers=n_hierarchical_layers,
+                        normalize_reps=normalize_reps,
+                        loss_exp=loss_exp,
+                        use_intrinsics=use_intrinsics,
+                        n_motion_eval_scenes=n_motion_eval_scenes,
+                        n_fixed_stride_eval_scenes=n_fixed_stride_eval_scenes,
+                        eval_stride_small=eval_stride_small,
+                        eval_stride_medium=eval_stride_medium,
+                        eval_stride_large=eval_stride_large,
+                        autocast_enabled=True,
+                        dtype_name=dtype_name_eval,
+                        per_layer_balance=per_layer_balance,
+                        eval_seed=int(os.environ.get("CAMERA_ROLLOUT_EVAL_SEED", "0")),
+                    )
+                    logger.info(
+                        "In-process camera rollout eval horizons=%s -> %s",
+                        horizons_list, rollout_out_dir,
+                    )
+                    # Expose per-horizon aggregate to the curve plotter.
+                    for key, hsum in rollout_summary.items():
+                        open_vec = hsum.get("open_loop_loss_by_step_mean") or []
+                        closed_vec = hsum.get("closed_loop_loss_by_step_mean") or []
+                        if open_vec:
+                            training_stats.setdefault(
+                                f"eval_rollout_{key}_open_mean", []
+                            ).append(float(np.mean(open_vec)))
+                        if closed_vec:
+                            training_stats.setdefault(
+                                f"eval_rollout_{key}_closed_mean", []
+                            ).append(float(np.mean(closed_vec)))
+                except Exception as _re:
+                    logger.warning(f"In-process rollout eval failed: {_re}")
 
     # ------------------------------------------------------------------ #
     # TRAINING LOOP
@@ -1150,7 +1393,9 @@ def main(args, resume_preempt=False):
 
                 with torch.no_grad():
                     full_clip = imgs.permute(0, 2, 1, 3, 4)
-                    h_target = _layerlist_to_h(encode_clip_as_images(target_encoder, full_clip))
+                    # Video path (tubelet_size=2): target_encoder returns per-layer
+                    # (B, T_tok*HW, D) tensors; concat gives (B, T_tok*HW, sum_D).
+                    h_target = _layerlist_to_h(target_encoder(full_clip))
                     h_target_tubelets = [
                         h_target[:, tubelet_idx * HW:(tubelet_idx + 1) * HW, :]
                         for tubelet_idx in range(total_tubelets)
@@ -1171,7 +1416,7 @@ def main(args, resume_preempt=False):
                 ctx_frame_start = local_start * tubelet_size
                 ctx_frame_end = (local_start + k_ctx) * tubelet_size
                 ctx_clip = imgs[:, ctx_frame_start:ctx_frame_end, :, :, :].permute(0, 2, 1, 3, 4)
-                ctx_layer_outs = encode_clip_as_images(encoder, ctx_clip)
+                ctx_layer_outs = encoder(ctx_clip)
                 h_context = torch.cat(ctx_layer_outs, dim=-1)
                 context_latents = [
                     h_context[:, tubelet_idx * HW:(tubelet_idx + 1) * HW, :]
@@ -1214,8 +1459,15 @@ def main(args, resume_preempt=False):
                         if normalize_reps:
                             p = F.layer_norm(p, (p.size(-1),))
                             t = F.layer_norm(t, (t.size(-1),))
+                        if per_layer_balance:
+                            # See comment in eval `_sample_latent_loss`. This
+                            # keeps each hierarchical layer's gradient on a
+                            # comparable scale when LN is disabled.
+                            scale = t.detach().std().clamp_min(1.0e-6)
+                        else:
+                            scale = 1.0
                         loss_pred = loss_pred + (
-                            torch.mean(torch.abs(p - t) ** loss_exp) / loss_exp
+                            torch.mean(torch.abs(p - t) ** loss_exp) / loss_exp / scale
                         )
                     loss_pred = loss_pred / n_hierarchical_layers
                     return loss_pred

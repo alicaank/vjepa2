@@ -52,6 +52,10 @@ def robust_checkpoint_loader(r_path: str, map_location: MAP_LOCATION = "cpu", ma
     Direct URLs:        https://... or http://...
     e.g.  https://dl.fbaipublicfiles.com/vjepa2/vitl.pt
     """
+    r_path = os.fspath(r_path)
+    if isinstance(r_path, bytes):
+        r_path = r_path.decode()
+
     if r_path.startswith(_HF_PREFIX):
         r_path = _resolve_hf_path(r_path)
     elif r_path.startswith(_HTTPS_PREFIX) or r_path.startswith(_HTTP_PREFIX):

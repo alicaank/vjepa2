@@ -104,6 +104,81 @@ def _upgrade_camera_predictor_state_dict(pretrained_dict, model):
     return pretrained_dict
 
 
+def _lookup_state_dict_tensor(state_dict, key):
+    if key in state_dict:
+        return key, state_dict[key]
+    if key.startswith("module."):
+        bare_key = key[len("module."):]
+        if bare_key in state_dict:
+            return bare_key, state_dict[bare_key]
+    else:
+        module_key = f"module.{key}"
+        if module_key in state_dict:
+            return module_key, state_dict[module_key]
+    return None, None
+
+
+def _upgrade_camera_encoder_state_dict(pretrained_dict, model):
+    """Adapt V-JEPA 2.1 encoder weights for the CameraAC image-path setup.
+
+    CameraAC encodes each frame independently through ``patch_embed_img``
+    (temporal kernel = 1). The downloaded V-JEPA 2.1 checkpoint still carries
+    the video-path ``patch_embed`` kernel for the backbone's native
+    ``tubelet_size`` (e.g. 2), and PyTorch raises even with ``strict=False``
+    when that unused Conv3d weight has a different shape. Prefer the checkpoint's
+    image-path kernel when available; otherwise collapse the temporal dimension.
+    """
+    upgraded = dict(pretrained_dict)
+    model_state = model.state_dict()
+    remapped = []
+    dropped = []
+
+    for model_key, model_tensor in model_state.items():
+        ckpt_key, ckpt_tensor = _lookup_state_dict_tensor(upgraded, model_key)
+        if ckpt_tensor is None or ckpt_tensor.shape == model_tensor.shape:
+            continue
+
+        if model_key.endswith("patch_embed.proj.weight"):
+            img_key = model_key.replace("patch_embed.proj.weight", "patch_embed_img.proj.weight")
+            _, img_tensor = _lookup_state_dict_tensor(upgraded, img_key)
+            if img_tensor is not None and img_tensor.shape == model_tensor.shape:
+                upgraded[model_key] = img_tensor.detach().clone()
+                remapped.append(
+                    f"{model_key} <- {img_key} {tuple(img_tensor.shape)}"
+                )
+                continue
+
+            if (
+                ckpt_tensor.ndim == model_tensor.ndim == 5
+                and ckpt_tensor.shape[:2] == model_tensor.shape[:2]
+                and ckpt_tensor.shape[3:] == model_tensor.shape[3:]
+                and model_tensor.shape[2] == 1
+            ):
+                upgraded[model_key] = ckpt_tensor.mean(dim=2, keepdim=True)
+                remapped.append(
+                    f"{model_key} <- temporal-mean({tuple(ckpt_tensor.shape)} -> {tuple(model_tensor.shape)})"
+                )
+                continue
+
+        upgraded.pop(ckpt_key, None)
+        dropped.append(
+            f"{ckpt_key} checkpoint={tuple(ckpt_tensor.shape)} model={tuple(model_tensor.shape)}"
+        )
+
+    if remapped:
+        logger.info(
+            "Adapted pretrained encoder weights for CameraAC image-path loading: %s",
+            "; ".join(remapped),
+        )
+    if dropped:
+        logger.warning(
+            "Dropped incompatible pretrained encoder tensors during CameraAC load: %s",
+            "; ".join(dropped),
+        )
+
+    return upgraded
+
+
 def load_pretrained(
     r_path,
     encoder=None,
@@ -121,6 +196,7 @@ def load_pretrained(
     if load_encoder:
         pretrained_dict = checkpoint[context_encoder_key]
         pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        pretrained_dict = _upgrade_camera_encoder_state_dict(pretrained_dict, encoder)
         msg = encoder.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
 
@@ -134,6 +210,7 @@ def load_pretrained(
     if load_encoder and target_encoder is not None:
         pretrained_dict = checkpoint[target_encoder_key]
         pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        pretrained_dict = _upgrade_camera_encoder_state_dict(pretrained_dict, target_encoder)
         msg = target_encoder.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}")
 
@@ -168,10 +245,36 @@ def load_checkpoint(
         pretrained_dict = checkpoint[key]
         for kw in replace_kw:
             pretrained_dict = {k.replace(kw, ""): v for k, v in pretrained_dict.items()}
+        # Strip DDP ``module.`` prefix when the live model is not DDP-wrapped.
+        # DDP-wrapped training (e.g. 2×H100) saves ``encoder.state_dict()``
+        # with keys like ``module.blocks.0...`` whereas subprocess evaluation
+        # paths build an unwrapped model. Without this strip, ``load_state_dict``
+        # silently matches zero keys (strict=False) and leaves the predictor at
+        # random init / encoder at pretrained, producing degenerate rollout
+        # evals that look identical across every experiment.
+        live_keys = set(model.state_dict().keys())
+        if pretrained_dict and all(k.startswith("module.") for k in pretrained_dict.keys()):
+            live_is_wrapped = any(k.startswith("module.") for k in live_keys)
+            if not live_is_wrapped:
+                pretrained_dict = {k[len("module."):]: v for k, v in pretrained_dict.items()}
+        if key in ("encoder", "target_encoder"):
+            pretrained_dict = _upgrade_camera_encoder_state_dict(pretrained_dict, model)
         if key == "predictor":
             pretrained_dict = _upgrade_camera_predictor_state_dict(pretrained_dict, model)
         msg = model.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded {key} from epoch {epoch} with msg: {msg}")
+        # Fail loud when a non-trivial load matched zero keys — this almost
+        # always means a prefix / naming mismatch silently zeroed the model.
+        n_missing = len(getattr(msg, "missing_keys", []) or [])
+        n_expected = len(live_keys)
+        if n_expected > 0 and n_missing >= n_expected:
+            raise RuntimeError(
+                f"load_checkpoint: {key} matched 0 keys "
+                f"(missing={n_missing}/{n_expected}). Checkpoint keys likely "
+                "have a different prefix (e.g. DDP ``module.``) than the "
+                "live model. Aborting so rollout/eval metrics are not run "
+                "on an untrained model."
+            )
         # Fail loud when the live predictor is missing experiment-flag submodules
         # present in the checkpoint. Silent drops invalidate ablation metrics.
         if key == "predictor":
@@ -418,8 +521,9 @@ def init_video_model(
 
     encoder.to(device)
     predictor.to(device)
-    logger.info(encoder)
-    logger.info(predictor)
+    if os.environ.get("VJEPA_VERBOSE_MODEL_REPR", "0") == "1":
+        logger.info(encoder)
+        logger.info(predictor)
 
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)

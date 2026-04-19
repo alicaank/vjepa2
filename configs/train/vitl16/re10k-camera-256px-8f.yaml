@@ -46,7 +46,7 @@ meta:
   context_encoder_key: ema_encoder
   target_encoder_key: ema_encoder
   save_every_freq: 10
-  checkpoint_save_mode: weights_only_no_target
+  checkpoint_save_mode: full
   seed: 42
   use_sdpa: true
   sync_gc: false

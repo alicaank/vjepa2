@@ -3,12 +3,14 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+
 import torch
 
-# VJEPA_BASE_URL = "https://dl.fbaipublicfiles.com/vjepa2"
-
-# for testing
-VJEPA_BASE_URL = "http://localhost:8300"
+# Production default with optional env override for local mirrors/tests.
+VJEPA_BASE_URL = os.environ.get(
+    "VJEPA_BASE_URL", "https://dl.fbaipublicfiles.com/vjepa2"
+).rstrip("/")
 
 ARCH_NAME_MAP = {
     # V-JEPA 2
