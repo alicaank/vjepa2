@@ -36,6 +36,55 @@ loss:
   context_loss_weight: 0.0
   rollout_train_steps: 1
   rollout_loss_decay: 0.5
+  # Phase R — pose-reversibility cycle loss (TCR design section 3.4).
+  # Validated auxiliary: cycle.enabled=true with weight=0.02, horizon=1
+  # is the recommended "final role" config (see TCR design §3'.4).
+  # Currently still disabled by default to preserve reproducibility of
+  # ablations that opt in explicitly via env vars; new experiments
+  # SHOULD opt in with the values below. Do not strengthen further
+  # (no horizon>1, no group-law extensions — see TCR design §3' for
+  # the negative result that closes that path).
+  cycle:
+    enabled: false
+    weight: 0.02              # final post-warmup weight on cycle_l1_h1
+    horizon: 1                # K; pilot supports K=1 only
+    start_epoch: 5            # epochs before any cycle weight is applied
+    ramp_end_epoch: 15        # linear ramp from start to final weight
+    seed: predicted           # "predicted" (R-pilot) | "teacher_forced" (R4 ablation)
+    visibility_mask: none     # "none" | "adaptive" (R2 ablation)
+    detach_forward: false     # if true, detach forward seed before backward call
+
+  # Phase R' — SE(3) group-composition consistency loss.
+  # *** NEGATIVE RESULT — DO NOT USE IN MAIN METHOD. ***
+  # Strengthens Phase R from inverse-only consistency
+  #   F(F(z, a), a^{-1}) ≈ z
+  # to the full two-step group law
+  #   F(z, compose(a, b)) ≈ F(F(z, a), b)
+  # Two pilots tested at 200 epochs:
+  #   v1 (anchor-only):    H20 gap(m) = 0.0528 vs R-pilot 0.04817 (+9.6%)
+  #   v2 (anchor+pathpath): H20 gap(m) = 0.0583 vs R-pilot 0.04817 (+21.0%)
+  # Both preserved one-step accuracy but regressed closed-loop rollout,
+  # worst at H12/H20 mid-gap. Conclusion: dense V-JEPA latent transitions
+  # are informed by SE(3) but are NOT a strict group representation —
+  # disocclusion, completion, and context-dependent attention break
+  # path-independence. Forcing full group-law consistency adds gradient
+  # noise that integrates over horizons. Inverse-cycle (Phase R) is the
+  # right scope for algebraic regularization on this architecture.
+  # The next architectural step is geometry-aware correspondence
+  # (epipolar attention bias) + visibility-aware completion, not
+  # stronger algebraic consistency.
+  # The block below is kept for reproducibility of the negative-result
+  # ablation only; new experiments must leave enabled: false.
+  composition:
+    enabled: false
+    weight: 0.02              # final post-warmup weight on composition_l1
+    start_epoch: 5            # epochs before any composition weight is applied
+    ramp_end_epoch: 15        # linear ramp from start to final weight
+    seed: teacher             # "teacher" (GT latent at start, R'-pilot) | "predicted"
+    supervised_anchor: true   # add L1(composed_pred, z_gt_t+2) — the primary signal
+    path_path_weight: 0.0     # L1(composed_pred, sequential_pred.detach()) coefficient
+    detach_rhs: true          # detach the sequential path target inside path_path term
+    max_pairs_per_batch: 1    # composition pairs per training step (pilot uses 1)
 meta:
   dtype: bfloat16
   resume_checkpoint: null
@@ -51,6 +100,16 @@ meta:
   use_sdpa: true
   sync_gc: false
 model:
+  # Encoder backbone for the camera-AC predictor.
+  #   ``vjepa21`` (default): canonical V-JEPA 2.1 ViT-L (image-path forward).
+  #   ``mast3r``: MASt3REncoderAdapter wrapping AsymmetricMASt3R ViT-L
+  #     (24 blocks, 1024-dim, 16 heads, taps [5,11,17,23]) — drop-in for
+  #     V-JEPA 2.1 at the same crop_size + patch_size. See
+  #     ``@/home/ak/GWM/thirdparty/vjepa2/app/vjepa_camera_re10k/mast3r_encoder.py``.
+  # Both defaults below are also overridable via ENCODER_BACKBONE /
+  # ENCODER_FREEZE env vars (init_video_model honours both).
+  encoder_backbone: vjepa21
+  encoder_freeze: false           # ignored for vjepa21 (uses enc_lr_scale path); mast3r honours it.
   model_name: vit_large
   pred_depth: 12
   pred_embed_dim: 1024
@@ -81,6 +140,36 @@ model:
   use_residual_head: true
   residual_head_depth: 2
   residual_head_ratio: 2.0
+  # Phase C — inference-time latent corrector (TCR design §5).
+  # Disabled by default. Enable with model.corrector.enabled: true; pick
+  # mode=frozen_predictor for the C1 ablation (cleanest isolation), or
+  # mode=joint for the C2 best-numbers configuration.
+  corrector:
+    enabled: false
+    mode: joint               # "frozen_predictor" (C1) | "joint" (C2)
+    hidden: 512
+    step_embed_dim: 32
+    pose_embed_dim: 32
+    residual_scale_init: 0.01
+    residual_scale_max: 0.25
+    denoise_weight: 0.3
+    # If unset, falls back to loss.rollout_noise_std at construction time.
+    # denoise_noise_std: 0.05
+    # Reserved for Phase R cycle horizon planning.
+    # max_rollout_steps: 32
+  # Phase E1 — rotation-homography correspondence attention bias.
+  # See ``@/home/ak/GWM/docs/CORRESPONDENCE_BIAS_E1.md`` for design.
+  # Disabled by default so every pre-correspondence run is bit-identical.
+  # Requires use_intrinsics=true (per-frame K is needed for the homography).
+  correspondence_bias:
+    enabled: false
+    mode: rotation_homography     # only mode in E1; epipolar (E2) is gated on E1 outcomes.
+    sigma_tokens: 2.0             # Gaussian width in token-grid units (= 2 * patch_size px).
+    lambda_init: 0.0              # parity-with-baseline at step 0; learns up.
+    learnable: true               # per-layer scalar lambda is trainable.
+    apply_layers: [0, 1, 2, 3, 4, 5]
+    start_epoch: 0                # ramp begins at this epoch (inclusive).
+    ramp_end_epoch: 5             # ramp reaches 1.0 by this epoch.
 optimization:
   anneal: 15
   epochs: 50

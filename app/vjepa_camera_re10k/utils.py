@@ -225,6 +225,7 @@ def load_checkpoint(
     target_encoder,
     opt=None,
     scaler=None,
+    corrector=None,
     replace_kw=["backbone."],
 ):
     logger.info(f"Loading checkpoint from {r_path}")
@@ -236,7 +237,21 @@ def load_checkpoint(
     if "target_encoder" not in checkpoint and "encoder" in checkpoint:
         checkpoint["target_encoder"] = checkpoint["encoder"]
 
-    for key, model in [("encoder", encoder), ("predictor", predictor), ("target_encoder", target_encoder)]:
+    model_key_pairs = [("encoder", encoder), ("predictor", predictor), ("target_encoder", target_encoder)]
+    if corrector is not None:
+        # Corrector load is best-effort: pre-corrector checkpoints simply
+        # don't have the key, in which case the corrector keeps its small
+        # ~zero init. This matches the design doc's backward-compat rule
+        # (§5.6, ckpt key remap).
+        if "corrector" in checkpoint:
+            model_key_pairs.append(("corrector", corrector))
+        else:
+            logger.warning(
+                "Resume checkpoint has no 'corrector' key; corrector retains "
+                "its initialization (residual_scale_init~=0, near no-op)."
+            )
+
+    for key, model in model_key_pairs:
         if model is None:
             continue
         if key not in checkpoint:
@@ -284,6 +299,8 @@ def load_checkpoint(
                 "predictor_proj_delta.",
                 "residual_refine.",
                 "residual_gate",
+                "completion_refine.",
+                "completion_gate",
             )
             leaked = [k for k in unexpected if any(k.startswith(p) for p in flag_prefixes)]
             if leaked:
@@ -392,11 +409,48 @@ def init_video_model(
     use_ray_pe=False,
     ray_pe_dim=6,
     ray_pe_hidden=256,
+    ray_pe_mode="origin_dir",
+    ray_visibility_features="none",
+    pose_conditioning_mode="token+raymap",
     use_delta_head=False,
     use_residual_head=False,
     residual_head_depth=2,
     residual_head_ratio=2.0,
+    use_completion_head=False,
+    completion_head_depth=2,
+    completion_head_ratio=2.0,
+    use_fsq_head=False,
+    fsq_total_code_axes=0,
+    fsq_levels=0,
+    warp_context_latents=False,
+    warp_context_padding_mode="border",
+    warp_mode="auto",
+    depth_probe_checkpoint=None,
+    correspondence_bias_enabled=False,
+    correspondence_bias_mode="rotation_homography",
+    correspondence_bias_sigma_tokens=2.0,
+    correspondence_bias_lambda_init=0.0,
+    correspondence_bias_learnable=True,
+    correspondence_bias_apply_layers=(0, 1, 2, 3, 4, 5),
+    encoder_backbone="vjepa21",
+    encoder_freeze=False,
 ):
+    # Encoder backbone selection. ``vjepa21`` (default) preserves the
+    # canonical V-JEPA 2.1 ViT-L behaviour bit-for-bit. ``mast3r`` swaps
+    # in the pretrained MASt3R encoder via ``MASt3REncoderAdapter``; the
+    # token grid (24x24x1024) and num_heads (16) match V-JEPA 2.1
+    # exactly so the predictor side is unchanged.
+    encoder_backbone = os.environ.get("ENCODER_BACKBONE", encoder_backbone) or "vjepa21"
+    encoder_backbone = str(encoder_backbone).lower().strip()
+    if encoder_backbone not in ("vjepa21", "mast3r"):
+        raise ValueError(
+            f"encoder_backbone={encoder_backbone!r} unsupported. "
+            f"Expected 'vjepa21' or 'mast3r'."
+        )
+    if os.environ.get("ENCODER_FREEZE") is not None:
+        encoder_freeze = _env_bool("ENCODER_FREEZE", encoder_freeze)
+    encoder_freeze = bool(encoder_freeze)
+
     # Ablation-flag env-var fallback. Callers that do not explicitly pass the
     # experiment flags (e.g. the rollout eval tool) still build the correct
     # predictor when USE_RAY_PE / USE_DELTA_HEAD / USE_RESIDUAL_HEAD are set
@@ -404,16 +458,185 @@ def init_video_model(
     use_ray_pe = bool(use_ray_pe) or _env_bool("USE_RAY_PE", False)
     ray_pe_dim = _env_int("RAY_PE_DIM", ray_pe_dim)
     ray_pe_hidden = _env_int("RAY_PE_HIDDEN", ray_pe_hidden)
+    # RayMap v2 representation. ``origin_dir`` (default) is the legacy 6D
+    # [origin, dir] concat (bit-identical to the original ``ray_pe`` ablation).
+    # ``plucker`` substitutes [dir, origin×dir] (still 6D); ``plucker_delta``
+    # extends to 12D with per-frame delta vs the anchor frame. RAY_PE_DIM
+    # must be 6 for origin_dir/plucker and 12 for plucker_delta.
+    ray_pe_mode = os.environ.get("RAY_PE_MODE", ray_pe_mode) or "origin_dir"
+    # DA3 RayMap v3 (2026-04-30): pose_conditioning_mode controls whether the
+    # per-frame state token is dropped in favour of the dense per-patch raymap.
+    # ``token+raymap`` (default) is byte-identical to every prior pilot.
+    # ``raymap_only`` requires use_ray_pe=True (validated in the predictor).
+    pose_conditioning_mode = os.environ.get(
+        "POSE_CONDITIONING_MODE", pose_conditioning_mode
+    ) or "token+raymap"
+    # RayMap v4c (2026-05-01): ray_visibility_features adds a rotation-only
+    # warp correspondence block (uv_warp, valid, border) to plucker_pair.
+    # Only valid with ray_pe_mode='plucker_pair'. See history doc §4.6.
+    ray_visibility_features = os.environ.get(
+        "RAY_VISIBILITY_FEATURES", ray_visibility_features
+    ) or "none"
+    if use_ray_pe and ray_pe_mode == "plucker_delta" and ray_pe_dim == 6:
+        # Convenience: auto-promote to 12D when the user selects plucker_delta
+        # without explicitly bumping RAY_PE_DIM. Avoids a confusing crash in
+        # the predictor's __init__ when only RAY_PE_MODE was changed.
+        ray_pe_dim = 12
+    if use_ray_pe and ray_pe_mode == "plucker_pair":
+        # Auto-promote ray_pe_dim for plucker_pair: 22 base + 4 if visibility
+        # features enabled. Same convenience pattern as plucker_delta.
+        expected_pair_dim = 22 + (4 if ray_visibility_features == "warp_plus_border" else 0)
+        if ray_pe_dim in (6, 12):
+            ray_pe_dim = expected_pair_dim
     use_delta_head = bool(use_delta_head) or _env_bool("USE_DELTA_HEAD", False)
     use_residual_head = bool(use_residual_head) or _env_bool("USE_RESIDUAL_HEAD", False)
     residual_head_depth = _env_int("RESIDUAL_HEAD_DEPTH", residual_head_depth)
     residual_head_ratio = _env_float("RESIDUAL_HEAD_RATIO", residual_head_ratio)
+    use_completion_head = bool(use_completion_head) or _env_bool("USE_COMPLETION_HEAD", False)
+    completion_head_depth = _env_int("COMPLETION_HEAD_DEPTH", completion_head_depth)
+    completion_head_ratio = _env_float("COMPLETION_HEAD_RATIO", completion_head_ratio)
+    # Rotation-only homography warp of context-frame tokens into the target
+    # frame's grid. Diagnostic ablation; defaults to off so existing runs are
+    # bit-identical. Requires use_intrinsics=True (per-frame K).
+    warp_context_latents = bool(warp_context_latents) or _env_bool("WARP_CONTEXT_LATENTS", False)
+    warp_context_padding_mode = os.environ.get("WARP_CONTEXT_PADDING_MODE", warp_context_padding_mode)
+    # Path B-lite Step 1 — warp_mode + depth_probe_checkpoint env fallback.
+    # ``WARP_MODE`` overrides the kwarg when set; ``DEPTH_PROBE_CHECKPOINT``
+    # is a path to the checkpoint produced by tools/train_depth_probe_re10k.py
+    # (required when warp_mode='projective_probe').
+    warp_mode = os.environ.get("WARP_MODE", warp_mode) or "auto"
+    depth_probe_checkpoint = (
+        os.environ.get("DEPTH_PROBE_CHECKPOINT") or depth_probe_checkpoint
+    )
+    if depth_probe_checkpoint is not None:
+        depth_probe_checkpoint = str(depth_probe_checkpoint)
+    # Phase E1 correspondence-bias env-var fallback. Mirrors the warp pattern.
+    correspondence_bias_enabled = bool(correspondence_bias_enabled) or _env_bool("CORR_BIAS_ENABLED", False)
+    correspondence_bias_mode = os.environ.get("CORR_BIAS_MODE", correspondence_bias_mode)
+    correspondence_bias_sigma_tokens = _env_float("CORR_BIAS_SIGMA_TOKENS", correspondence_bias_sigma_tokens)
+    correspondence_bias_lambda_init = _env_float("CORR_BIAS_LAMBDA_INIT", correspondence_bias_lambda_init)
+    if os.environ.get("CORR_BIAS_LEARNABLE") is not None:
+        correspondence_bias_learnable = _env_bool("CORR_BIAS_LEARNABLE", correspondence_bias_learnable)
+    apply_layers_env = _env_int_list("CORR_BIAS_APPLY_LAYERS")
+    if apply_layers_env is not None:
+        correspondence_bias_apply_layers = tuple(apply_layers_env)
     logger.info(
         "init_video_model experiment flags: "
-        f"use_ray_pe={use_ray_pe} (dim={ray_pe_dim}, hidden={ray_pe_hidden}) "
+        f"encoder_backbone={encoder_backbone} (freeze={encoder_freeze}) "
+        f"use_ray_pe={use_ray_pe} (mode={ray_pe_mode}, dim={ray_pe_dim}, hidden={ray_pe_hidden}, "
+        f"visibility_features={ray_visibility_features}) "
+        f"pose_conditioning_mode={pose_conditioning_mode} "
         f"use_delta_head={use_delta_head} "
-        f"use_residual_head={use_residual_head} (depth={residual_head_depth}, ratio={residual_head_ratio})"
+        f"use_residual_head={use_residual_head} (depth={residual_head_depth}, ratio={residual_head_ratio}) "
+        f"use_completion_head={use_completion_head} (depth={completion_head_depth}, ratio={completion_head_ratio}) "
+        f"warp_context_latents={warp_context_latents} (padding={warp_context_padding_mode}) "
+        f"warp_mode={warp_mode} depth_probe_checkpoint={depth_probe_checkpoint} "
+        f"correspondence_bias_enabled={correspondence_bias_enabled} "
+        f"(mode={correspondence_bias_mode}, sigma={correspondence_bias_sigma_tokens}, "
+        f"lambda_init={correspondence_bias_lambda_init}, learnable={correspondence_bias_learnable}, "
+        f"apply_layers={tuple(correspondence_bias_apply_layers)})"
     )
+
+    # ------------------------------------------------------------------
+    # Encoder branch.
+    #
+    # ``vjepa21`` (default): build the canonical V-JEPA 2.1 ViT and pick
+    # the canonical ``hierarchical_layers`` taps. Bit-identical to all
+    # prior runs.
+    #
+    # ``mast3r``: build a MASt3REncoderAdapter at the same crop_size and
+    # patch_size. The adapter exposes V-JEPA-compatible attributes
+    # (``embed_dim``, ``num_heads``, ``hierarchical_layers``,
+    # ``out_layers``, ``img_temporal_dim_size=1``) and a forward that
+    # returns the same per-tap list shape, so the predictor side is
+    # unchanged. ``encoder_freeze`` defaults to False here but is set by
+    # the shell driver / Azure YAML to ``True`` for the MASt3R pilot
+    # (matching the user-selected ``enc_lr_scale=0.0`` protocol).
+    # ------------------------------------------------------------------
+    if encoder_backbone == "mast3r":
+        from app.vjepa_camera_re10k.mast3r_encoder import MASt3REncoderAdapter
+
+        encoder = MASt3REncoderAdapter(
+            img_size=crop_size,
+            patch_size=patch_size,
+            freeze=encoder_freeze,
+        )
+        # Validate the predictor's per-layer head split is consistent
+        # with the adapter's chosen taps.
+        if n_hierarchical_layers != len(encoder.hierarchical_layers):
+            raise ValueError(
+                f"n_hierarchical_layers={n_hierarchical_layers} but the MASt3R "
+                f"adapter has hierarchical_layers={encoder.hierarchical_layers} "
+                f"(len={len(encoder.hierarchical_layers)}). They must match "
+                f"because the predictor splits target features by this count."
+            )
+
+        _out_embed_dim = out_embed_dim if out_embed_dim is not None else encoder.embed_dim
+
+        predictor = cam_pred.vit_camera_ac_predictor(
+            img_size=crop_size,
+            patch_size=patch_size,
+            num_frames=max_num_frames,
+            tubelet_size=tubelet_size,
+            embed_dim=encoder.embed_dim,
+            predictor_embed_dim=pred_embed_dim,
+            n_hierarchical_layers=n_hierarchical_layers,
+            out_embed_dim=_out_embed_dim,
+            depth=pred_depth,
+            num_heads=encoder.num_heads if pred_num_heads is None else pred_num_heads,
+            uniform_power=uniform_power,
+            use_rope=use_rope,
+            use_silu=use_pred_silu,
+            wide_silu=wide_silu,
+            is_frame_causal=pred_is_frame_causal,
+            use_activation_checkpointing=use_activation_checkpointing,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            intrinsics_dim=intrinsics_dim,
+            use_intrinsics=use_intrinsics,
+            predict_all=predict_all,
+            use_ray_pe=use_ray_pe,
+            ray_pe_dim=ray_pe_dim,
+            ray_pe_hidden=ray_pe_hidden,
+            ray_pe_mode=ray_pe_mode,
+            ray_visibility_features=ray_visibility_features,
+            pose_conditioning_mode=pose_conditioning_mode,
+            use_delta_head=use_delta_head,
+            use_residual_head=use_residual_head,
+            residual_head_depth=residual_head_depth,
+            residual_head_ratio=residual_head_ratio,
+            use_completion_head=use_completion_head,
+            completion_head_depth=completion_head_depth,
+            completion_head_ratio=completion_head_ratio,
+            use_fsq_head=use_fsq_head,
+            fsq_total_code_axes=fsq_total_code_axes,
+            fsq_levels=fsq_levels,
+            warp_context_latents=warp_context_latents,
+            warp_context_padding_mode=warp_context_padding_mode,
+            warp_mode=warp_mode,
+            depth_probe_checkpoint=depth_probe_checkpoint,
+            correspondence_bias_enabled=correspondence_bias_enabled,
+            correspondence_bias_mode=correspondence_bias_mode,
+            correspondence_bias_sigma_tokens=correspondence_bias_sigma_tokens,
+            correspondence_bias_lambda_init=correspondence_bias_lambda_init,
+            correspondence_bias_learnable=correspondence_bias_learnable,
+            correspondence_bias_apply_layers=tuple(correspondence_bias_apply_layers),
+        )
+
+        encoder.to(device)
+        predictor.to(device)
+        if os.environ.get("VJEPA_VERBOSE_MODEL_REPR", "0") == "1":
+            logger.info(encoder)
+            logger.info(predictor)
+
+        n_enc_total = sum(p.numel() for p in encoder.parameters())
+        n_enc_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+        logger.info(
+            f"Encoder (MASt3R): total={n_enc_total:,}  trainable={n_enc_trainable:,}"
+        )
+        logger.info(f"Predictor number of parameters: {sum(p.numel() for p in predictor.parameters() if p.requires_grad):,}")
+
+        return encoder, predictor
 
     # Build the encoder. Instantiate once without out_layers so we can read the
     # canonical V-JEPA 2.1 hierarchical_layers (which the ViT hardcodes per
@@ -513,10 +736,29 @@ def init_video_model(
         use_ray_pe=use_ray_pe,
         ray_pe_dim=ray_pe_dim,
         ray_pe_hidden=ray_pe_hidden,
+        ray_pe_mode=ray_pe_mode,
+        ray_visibility_features=ray_visibility_features,
+        pose_conditioning_mode=pose_conditioning_mode,
         use_delta_head=use_delta_head,
         use_residual_head=use_residual_head,
         residual_head_depth=residual_head_depth,
         residual_head_ratio=residual_head_ratio,
+        use_completion_head=use_completion_head,
+        completion_head_depth=completion_head_depth,
+        completion_head_ratio=completion_head_ratio,
+        use_fsq_head=use_fsq_head,
+        fsq_total_code_axes=fsq_total_code_axes,
+        fsq_levels=fsq_levels,
+        warp_context_latents=warp_context_latents,
+        warp_context_padding_mode=warp_context_padding_mode,
+        warp_mode=warp_mode,
+        depth_probe_checkpoint=depth_probe_checkpoint,
+        correspondence_bias_enabled=correspondence_bias_enabled,
+        correspondence_bias_mode=correspondence_bias_mode,
+        correspondence_bias_sigma_tokens=correspondence_bias_sigma_tokens,
+        correspondence_bias_lambda_init=correspondence_bias_lambda_init,
+        correspondence_bias_learnable=correspondence_bias_learnable,
+        correspondence_bias_apply_layers=tuple(correspondence_bias_apply_layers),
     )
 
     encoder.to(device)
@@ -543,6 +785,7 @@ def init_opt(
     warmup,
     anneal,
     num_epochs,
+    corrector=None,
     wd=1e-6,
     final_wd=1e-6,
     final_lr=0.0,
@@ -552,26 +795,62 @@ def init_opt(
     zero_init_bias_wd=True,
     enc_lr_scale=1.0,
 ):
-    param_groups = [
-        {
-            "params": (p for n, p in encoder.named_parameters() if ("bias" not in n) and (len(p.shape) != 1)),
-            "lr_scale": enc_lr_scale,
-        },
-        {
-            "params": (p for n, p in predictor.named_parameters() if ("bias" not in n) and (len(p.shape) != 1)),
-        },
-        {
-            "params": (p for n, p in encoder.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
+    # Filter on requires_grad so frozen modules (e.g. encoder + predictor in
+    # the corrector's frozen-predictor mode) do not contribute empty groups
+    # — AdamW raises on empty param groups in some configurations.
+    def _decay_params(module):
+        return [
+            p for n, p in module.named_parameters()
+            if p.requires_grad and ("bias" not in n) and (len(p.shape) != 1)
+        ]
+
+    def _no_decay_params(module):
+        return [
+            p for n, p in module.named_parameters()
+            if p.requires_grad and (("bias" in n) or (len(p.shape) == 1))
+        ]
+
+    param_groups = []
+    enc_decay = _decay_params(encoder)
+    if enc_decay:
+        param_groups.append({"params": enc_decay, "lr_scale": enc_lr_scale})
+    pred_decay = _decay_params(predictor)
+    if pred_decay:
+        param_groups.append({"params": pred_decay})
+    enc_nodecay = _no_decay_params(encoder)
+    if enc_nodecay:
+        param_groups.append({
+            "params": enc_nodecay,
             "WD_exclude": zero_init_bias_wd,
             "weight_decay": 0,
             "lr_scale": enc_lr_scale,
-        },
-        {
-            "params": (p for n, p in predictor.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
+        })
+    pred_nodecay = _no_decay_params(predictor)
+    if pred_nodecay:
+        param_groups.append({
+            "params": pred_nodecay,
             "WD_exclude": zero_init_bias_wd,
             "weight_decay": 0,
-        },
-    ]
+        })
+    if corrector is not None:
+        # Phase C — latent corrector: train at the same base lr as the
+        # predictor but with no decay on residual scales (treated as 1-D bias).
+        corr_decay = _decay_params(corrector)
+        if corr_decay:
+            param_groups.append({"params": corr_decay})
+        corr_nodecay = _no_decay_params(corrector)
+        if corr_nodecay:
+            param_groups.append({
+                "params": corr_nodecay,
+                "WD_exclude": zero_init_bias_wd,
+                "weight_decay": 0,
+            })
+
+    if not param_groups:
+        raise RuntimeError(
+            "init_opt: no trainable parameters found across encoder, predictor, "
+            "and corrector. Check requires_grad flags and corrector mode."
+        )
 
     optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
     scheduler = WSDSchedule(
