@@ -301,6 +301,10 @@ def load_checkpoint(
                 "residual_gate",
                 "completion_refine.",
                 "completion_gate",
+                "canvas_beta_by_type",
+                "canvas_mask_proj.",
+                "canvas_type_embed.",
+                "canvas_target_step_embed.",
             )
             leaked = [k for k in unexpected if any(k.startswith(p) for p in flag_prefixes)]
             if leaked:
@@ -308,7 +312,8 @@ def load_checkpoint(
                     "Predictor checkpoint contains experiment-flag weights that "
                     "are not present in the live model: "
                     f"{leaked}. The predictor was built without the matching "
-                    "USE_RAY_PE / USE_DELTA_HEAD / USE_RESIDUAL_HEAD flags. "
+                    "USE_RAY_PE / USE_DELTA_HEAD / USE_RESIDUAL_HEAD / "
+                    "TARGET_SLOT_MODE flags. "
                     "Set the corresponding environment variable (or kwarg) so "
                     "init_video_model instantiates the right modules before "
                     "loading this checkpoint."
@@ -419,6 +424,8 @@ def init_video_model(
     use_completion_head=False,
     completion_head_depth=2,
     completion_head_ratio=2.0,
+    use_four_layer_birth_head=False,
+    completion_head_hidden=512,
     use_fsq_head=False,
     fsq_total_code_axes=0,
     fsq_levels=0,
@@ -426,6 +433,13 @@ def init_video_model(
     warp_context_padding_mode="border",
     warp_mode="auto",
     depth_probe_checkpoint=None,
+    target_slot_mode="mask",
+    canvas_beta_init_valid=0.0,
+    canvas_beta_init_boundary=0.0,
+    canvas_beta_init_oov=0.0,
+    canvas_use_mask_feat_embed=True,
+    canvas_use_token_type_embed=True,
+    canvas_use_target_step_embed=True,
     correspondence_bias_enabled=False,
     correspondence_bias_mode="rotation_homography",
     correspondence_bias_sigma_tokens=2.0,
@@ -495,6 +509,8 @@ def init_video_model(
     use_completion_head = bool(use_completion_head) or _env_bool("USE_COMPLETION_HEAD", False)
     completion_head_depth = _env_int("COMPLETION_HEAD_DEPTH", completion_head_depth)
     completion_head_ratio = _env_float("COMPLETION_HEAD_RATIO", completion_head_ratio)
+    use_four_layer_birth_head = bool(use_four_layer_birth_head) or _env_bool("USE_FOUR_LAYER_BIRTH_HEAD", False)
+    completion_head_hidden = _env_int("COMPLETION_HEAD_HIDDEN", completion_head_hidden)
     # Rotation-only homography warp of context-frame tokens into the target
     # frame's grid. Diagnostic ablation; defaults to off so existing runs are
     # bit-identical. Requires use_intrinsics=True (per-frame K).
@@ -510,6 +526,13 @@ def init_video_model(
     )
     if depth_probe_checkpoint is not None:
         depth_probe_checkpoint = str(depth_probe_checkpoint)
+    target_slot_mode = os.environ.get("TARGET_SLOT_MODE", target_slot_mode) or "mask"
+    canvas_beta_init_valid = _env_float("CANVAS_BETA_INIT_VALID", canvas_beta_init_valid)
+    canvas_beta_init_boundary = _env_float("CANVAS_BETA_INIT_BOUNDARY", canvas_beta_init_boundary)
+    canvas_beta_init_oov = _env_float("CANVAS_BETA_INIT_OOV", canvas_beta_init_oov)
+    canvas_use_mask_feat_embed = _env_bool("CANVAS_USE_MASK_FEAT_EMBED", canvas_use_mask_feat_embed)
+    canvas_use_token_type_embed = _env_bool("CANVAS_USE_TOKEN_TYPE_EMBED", canvas_use_token_type_embed)
+    canvas_use_target_step_embed = _env_bool("CANVAS_USE_TARGET_STEP_EMBED", canvas_use_target_step_embed)
     # Phase E1 correspondence-bias env-var fallback. Mirrors the warp pattern.
     correspondence_bias_enabled = bool(correspondence_bias_enabled) or _env_bool("CORR_BIAS_ENABLED", False)
     correspondence_bias_mode = os.environ.get("CORR_BIAS_MODE", correspondence_bias_mode)
@@ -528,9 +551,11 @@ def init_video_model(
         f"pose_conditioning_mode={pose_conditioning_mode} "
         f"use_delta_head={use_delta_head} "
         f"use_residual_head={use_residual_head} (depth={residual_head_depth}, ratio={residual_head_ratio}) "
-        f"use_completion_head={use_completion_head} (depth={completion_head_depth}, ratio={completion_head_ratio}) "
+        f"use_completion_head={use_completion_head} (depth={completion_head_depth}, ratio={completion_head_ratio}, "
+        f"four_layer_birth={use_four_layer_birth_head}, hidden={completion_head_hidden}) "
         f"warp_context_latents={warp_context_latents} (padding={warp_context_padding_mode}) "
         f"warp_mode={warp_mode} depth_probe_checkpoint={depth_probe_checkpoint} "
+        f"target_slot_mode={target_slot_mode} "
         f"correspondence_bias_enabled={correspondence_bias_enabled} "
         f"(mode={correspondence_bias_mode}, sigma={correspondence_bias_sigma_tokens}, "
         f"lambda_init={correspondence_bias_lambda_init}, learnable={correspondence_bias_learnable}, "
@@ -608,6 +633,8 @@ def init_video_model(
             use_completion_head=use_completion_head,
             completion_head_depth=completion_head_depth,
             completion_head_ratio=completion_head_ratio,
+            use_four_layer_birth_head=use_four_layer_birth_head,
+            completion_head_hidden=completion_head_hidden,
             use_fsq_head=use_fsq_head,
             fsq_total_code_axes=fsq_total_code_axes,
             fsq_levels=fsq_levels,
@@ -615,6 +642,13 @@ def init_video_model(
             warp_context_padding_mode=warp_context_padding_mode,
             warp_mode=warp_mode,
             depth_probe_checkpoint=depth_probe_checkpoint,
+            target_slot_mode=target_slot_mode,
+            canvas_beta_init_valid=canvas_beta_init_valid,
+            canvas_beta_init_boundary=canvas_beta_init_boundary,
+            canvas_beta_init_oov=canvas_beta_init_oov,
+            canvas_use_mask_feat_embed=canvas_use_mask_feat_embed,
+            canvas_use_token_type_embed=canvas_use_token_type_embed,
+            canvas_use_target_step_embed=canvas_use_target_step_embed,
             correspondence_bias_enabled=correspondence_bias_enabled,
             correspondence_bias_mode=correspondence_bias_mode,
             correspondence_bias_sigma_tokens=correspondence_bias_sigma_tokens,
@@ -746,6 +780,8 @@ def init_video_model(
         use_completion_head=use_completion_head,
         completion_head_depth=completion_head_depth,
         completion_head_ratio=completion_head_ratio,
+        use_four_layer_birth_head=use_four_layer_birth_head,
+        completion_head_hidden=completion_head_hidden,
         use_fsq_head=use_fsq_head,
         fsq_total_code_axes=fsq_total_code_axes,
         fsq_levels=fsq_levels,
@@ -753,6 +789,13 @@ def init_video_model(
         warp_context_padding_mode=warp_context_padding_mode,
         warp_mode=warp_mode,
         depth_probe_checkpoint=depth_probe_checkpoint,
+        target_slot_mode=target_slot_mode,
+        canvas_beta_init_valid=canvas_beta_init_valid,
+        canvas_beta_init_boundary=canvas_beta_init_boundary,
+        canvas_beta_init_oov=canvas_beta_init_oov,
+        canvas_use_mask_feat_embed=canvas_use_mask_feat_embed,
+        canvas_use_token_type_embed=canvas_use_token_type_embed,
+        canvas_use_target_step_embed=canvas_use_target_step_embed,
         correspondence_bias_enabled=correspondence_bias_enabled,
         correspondence_bias_mode=correspondence_bias_mode,
         correspondence_bias_sigma_tokens=correspondence_bias_sigma_tokens,

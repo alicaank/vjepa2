@@ -636,11 +636,13 @@ def main(args, resume_preempt=False):
     use_completion_head = bool(cfgs_model.get("use_completion_head", False))
     completion_head_depth = int(cfgs_model.get("completion_head_depth", 2))
     completion_head_ratio = float(cfgs_model.get("completion_head_ratio", 2.0))
+    use_four_layer_birth_head = bool(cfgs_model.get("use_four_layer_birth_head", True))
+    completion_head_hidden = int(cfgs_model.get("completion_head_hidden", 512))
     # Rotation-only homography warp of context-frame tokens into target grid
     # (see CameraConditionedPredictorAC._warp_context_tokens). Diagnostic
     # ablation: default off, gated by cfgs_model and/or env var.
     warp_context_latents = bool(cfgs_model.get("warp_context_latents", False))
-    warp_context_padding_mode = str(cfgs_model.get("warp_context_padding_mode", "border"))
+    warp_context_padding_mode = str(cfgs_model.get("warp_context_padding_mode", "zeros"))
     # Path B-lite Step 1 — depth-aware projective warp via a frozen probe.
     # ``warp_mode`` selects the transport: "auto" maps to legacy behaviour
     # (rotation_only iff warp_context_latents=True else off); "rotation_only"
@@ -650,6 +652,14 @@ def main(args, resume_preempt=False):
     depth_probe_checkpoint = cfgs_model.get("depth_probe_checkpoint", None)
     if depth_probe_checkpoint is not None:
         depth_probe_checkpoint = str(depth_probe_checkpoint)
+    target_slot_mode = str(cfgs_model.get("target_slot_mode", "mask")).lower().strip()
+    canvas_beta_init_valid = float(cfgs_model.get("canvas_beta_init_valid", 0.0))
+    canvas_beta_init_boundary = float(cfgs_model.get("canvas_beta_init_boundary", 0.0))
+    canvas_beta_init_oov = float(cfgs_model.get("canvas_beta_init_oov", 0.0))
+    canvas_use_mask_feat_embed = bool(cfgs_model.get("canvas_use_mask_feat_embed", True))
+    canvas_use_token_type_embed = bool(cfgs_model.get("canvas_use_token_type_embed", True))
+    canvas_use_target_step_embed = bool(cfgs_model.get("canvas_use_target_step_embed", True))
+    use_posthoc_completion_blend = bool(cfgs_model.get("use_posthoc_completion_blend", True))
 
     # ------------------------------------------------------------------ #
     # Phase E1 — rotation-homography correspondence attention bias.
@@ -851,10 +861,76 @@ def main(args, resume_preempt=False):
         raise ImportError(
             "loss.completion.mask_source='da3' requires src.training.common.depth_teacher."
         )
+    # 1.4: when enabled, completion is blended into the *real* prediction path
+    # rather than being a side-branch auxiliary loss only.
+    #
+    # pred_final = pred_raw * (1 - M) + comp_preds * M
+    # where M = (reveal_mask + boundary_weight * boundary_mask).clamp(0, 1)
+    #
+    # pred_final is then used for: main loss, scheduled-sampling self-feed,
+    # corrector input, cycle / rollout state.  This directly plugs the gap
+    # where the completion head learns something useful but never fixes rollout.
+    #
+    # Requires: completion_enabled=True AND use_completion_head=True.
+    # Off by default so all legacy configs remain bit-identical.
+    completion_in_rollout = bool(cfgs_completion.get("in_rollout", False))
+    # E6: residual alpha-blend for main-path completion instead of full replace.
+    # pred_final = preds_next + alpha_now * M_birth * (comp_preds - preds_next)
+    # alpha=0 => E5/E2 aux-only, alpha=1 => original full-replace (E3/E4).
+    # alpha ramps from 0 to blend_alpha over alpha_ramp_epochs.
+    completion_blend_alpha = float(cfgs_completion.get("blend_alpha", 0.0))
+    completion_blend_alpha = float(os.environ.get("COMPLETION_BLEND_ALPHA", completion_blend_alpha))
+    completion_blend_alpha_ramp_epochs = int(cfgs_completion.get("blend_alpha_ramp_epochs", 0))
+    completion_blend_alpha_ramp_epochs = int(os.environ.get(
+        "COMPLETION_BLEND_ALPHA_RAMP_EPOCHS", completion_blend_alpha_ramp_epochs
+    ))
+    completion_oov_blend_alpha_cfg = cfgs_completion.get("oov_blend_alpha", None)
+    completion_boundary_blend_alpha_cfg = cfgs_completion.get("boundary_blend_alpha", None)
+    _oov_blend_alpha_env = os.environ.get("COMPLETION_OOV_BLEND_ALPHA", None)
+    _boundary_blend_alpha_env = os.environ.get("COMPLETION_BOUNDARY_BLEND_ALPHA", None)
+    if _oov_blend_alpha_env is not None and str(_oov_blend_alpha_env).strip() == "":
+        _oov_blend_alpha_env = None
+    if _boundary_blend_alpha_env is not None and str(_boundary_blend_alpha_env).strip() == "":
+        _boundary_blend_alpha_env = None
+    completion_use_region_blend_alpha = (
+        completion_oov_blend_alpha_cfg is not None
+        or completion_boundary_blend_alpha_cfg is not None
+        or _oov_blend_alpha_env is not None
+        or _boundary_blend_alpha_env is not None
+    )
+    completion_oov_blend_alpha = float(
+        _oov_blend_alpha_env
+        if _oov_blend_alpha_env is not None
+        else (completion_oov_blend_alpha_cfg if completion_oov_blend_alpha_cfg is not None else completion_blend_alpha)
+    )
+    completion_boundary_blend_alpha = float(
+        _boundary_blend_alpha_env
+        if _boundary_blend_alpha_env is not None
+        else (completion_boundary_blend_alpha_cfg if completion_boundary_blend_alpha_cfg is not None else 0.25 * completion_blend_alpha)
+    )
+    # E7: delay self-feed of pred_final (use preds_next for rollout) for the
+    # first N epochs, then switch to pred_final. 0 = no delay (E3/E4 behaviour).
+    completion_selffeed_delay_epochs = int(cfgs_completion.get("selffeed_delay_epochs", 0))
+    completion_selffeed_delay_epochs = int(os.environ.get(
+        "COMPLETION_SELFFEED_DELAY_EPOCHS", completion_selffeed_delay_epochs
+    ))
+    if completion_in_rollout and not (completion_enabled and use_completion_head):
+        logger.warning(
+            "loss.completion.in_rollout=True but completion is not fully enabled "
+            "(completion_enabled=%s, use_completion_head=%s); forcing in_rollout=False.",
+            completion_enabled, use_completion_head,
+        )
+        completion_in_rollout = False
     # Run B — residual target: predict z_target - warp(z_last, target)
     # instead of full z_target.  Requires warp_mode != "off" and a valid
     # depth_probe_checkpoint so the warped context is available.
     residual_target = bool(cfgs_loss.get("residual_target", False))
+    if residual_target and warp_mode == "off":
+        logger.warning(
+            "residual_target=True but warp_mode='off': warped_context_raw will "
+            "always be None so residual_target is a no-op. Forcing residual_target=False."
+        )
+        residual_target = False
     rollout_train_steps = max(1, int(cfgs_loss.get("rollout_train_steps", 1)))
     rollout_loss_decay = float(cfgs_loss.get("rollout_loss_decay", 0.5))
 
@@ -1137,6 +1213,8 @@ def main(args, resume_preempt=False):
         use_completion_head=use_completion_head,
         completion_head_depth=completion_head_depth,
         completion_head_ratio=completion_head_ratio,
+        use_four_layer_birth_head=use_four_layer_birth_head,
+        completion_head_hidden=completion_head_hidden,
         use_fsq_head=use_fsq_head,
         fsq_total_code_axes=fsq_total_code_axes,
         fsq_levels=fsq_levels,
@@ -1144,6 +1222,13 @@ def main(args, resume_preempt=False):
         warp_context_padding_mode=warp_context_padding_mode,
         warp_mode=warp_mode,
         depth_probe_checkpoint=depth_probe_checkpoint,
+        target_slot_mode=target_slot_mode,
+        canvas_beta_init_valid=canvas_beta_init_valid,
+        canvas_beta_init_boundary=canvas_beta_init_boundary,
+        canvas_beta_init_oov=canvas_beta_init_oov,
+        canvas_use_mask_feat_embed=canvas_use_mask_feat_embed,
+        canvas_use_token_type_embed=canvas_use_token_type_embed,
+        canvas_use_target_step_embed=canvas_use_target_step_embed,
         correspondence_bias_enabled=correspondence_bias_enabled,
         correspondence_bias_mode=correspondence_bias_mode,
         correspondence_bias_sigma_tokens=correspondence_bias_sigma_tokens,
@@ -1810,6 +1895,14 @@ def main(args, resume_preempt=False):
         training_stats["completion_visible_frac"] = []
         training_stats["completion_boundary_frac"] = []
         training_stats["completion_disoccluded_frac"] = []
+    if target_slot_mode == "canvas_first":
+        training_stats["canvas_valid_frac"] = []
+        training_stats["canvas_oov_frac"] = []
+        training_stats["canvas_boundary_frac"] = []
+        training_stats["canvas_beta_valid"] = []
+        training_stats["canvas_beta_boundary"] = []
+        training_stats["canvas_beta_oov"] = []
+        training_stats["canvas_input_norm_ratio"] = []
     training_stats["drift_from_prev"] = []
 
     def run_checkpoint_evaluation(epoch, previous_epoch=None):
@@ -1991,15 +2084,48 @@ def main(args, resume_preempt=False):
             ctx_lo = _enc(ctx_clip)
             h_ctx = torch.cat(ctx_lo, dim=-1)
             B_v = h_ctx.shape[0]
-            future_tokens_v = _pred.future_mask_token.to(device=device, dtype=h_ctx.dtype).expand(
-                B_v, HW, -1
-            )
+            if target_slot_mode == "canvas_first" and hasattr(_pred, "build_target_canvas_inputs"):
+                local_states_eval_canvas = _canonicalize_states(v_states[:, :target_idx + 1])
+                local_actions_eval_canvas = v_actions[:, :target_idx + 1]
+                local_intr_eval_canvas = (
+                    v_intrinsics[:, :target_idx + 1] if use_intrinsics else None
+                )
+                canvas_inputs_v = _pred.build_target_canvas_inputs(
+                    h_ctx,
+                    local_states_eval_canvas,
+                    local_actions_eval_canvas,
+                    local_intr_eval_canvas,
+                )
+                boundary_v = _rotation_unseen_boundary_mask(
+                    _pred,
+                    local_states_eval_canvas,
+                    local_intr_eval_canvas,
+                    HW,
+                    h_ctx.dtype,
+                    intermediate_unseen_boundary_band,
+                )
+                future_tokens_v = _pred.prepare_canvas_slot(
+                    warped_context_raw=canvas_inputs_v["warped_context_raw"],
+                    valid_mask=canvas_inputs_v["valid_mask"],
+                    oov_mask=canvas_inputs_v["oov_mask"],
+                    boundary_mask=boundary_v,
+                    confidence_mask=canvas_inputs_v["confidence_mask"],
+                    rollout_step=max(0, target_idx - 1),
+                )
+            else:
+                future_tokens_v = _pred.future_mask_token.to(device=device, dtype=h_ctx.dtype).expand(
+                    B_v, HW, -1
+                )
             h_in = torch.cat([h_ctx, future_tokens_v], dim=1)
             preds_v, _, _delta_v, _fsq_v, _warped_ctx_v = _pred(
                 h_in,
-                v_actions[:, :target_idx + 1],
-                v_states[:, :target_idx + 1],
-                intrinsics=v_intrinsics[:, :target_idx + 1] if use_intrinsics else None,
+                local_actions_eval_canvas if target_slot_mode == "canvas_first" else v_actions[:, :target_idx + 1],
+                local_states_eval_canvas if target_slot_mode == "canvas_first" else v_states[:, :target_idx + 1],
+                intrinsics=(
+                    local_intr_eval_canvas
+                    if target_slot_mode == "canvas_first"
+                    else (v_intrinsics[:, :target_idx + 1] if use_intrinsics else None)
+                ),
             )
             region_masks = None
             if completion_enabled:
@@ -2370,6 +2496,46 @@ def main(args, resume_preempt=False):
         completion_visible_meter = AverageMeter()
         completion_boundary_meter = AverageMeter()
         completion_disoccluded_meter = AverageMeter()
+        birth_delta_norm_meter = AverageMeter()
+        birth_action_norm_meter = AverageMeter()
+        birth_mask_norm_meter = AverageMeter()
+        birth_M_mean_meter = AverageMeter()
+        birth_oov_mean_meter = AverageMeter()
+        birth_bnd_mean_meter = AverageMeter()
+        action_in_norm_meter = AverageMeter()
+        action_out_norm_meter = AverageMeter()
+        action_trans_cos_meter = AverageMeter()
+        action_trans_delta_meter = AverageMeter()
+        action_trans_ratio_meter = AverageMeter()
+        action_rot_delta_meter = AverageMeter()
+        birth_raw_err_meter = AverageMeter()
+        birth_comp_err_meter = AverageMeter()
+        birth_final_err_meter = AverageMeter()
+        birth_raw_layer_meters = [AverageMeter() for _ in range(n_hierarchical_layers)]
+        birth_comp_layer_meters = [AverageMeter() for _ in range(n_hierarchical_layers)]
+        birth_final_layer_meters = [AverageMeter() for _ in range(n_hierarchical_layers)]
+        # P0.5/P0.6: per-layer prediction L1 and warp-depth diagnostics.
+        # layer_loss_L{i} = mean abs error in the i-th hierarchical layer.
+        # depth_std = spatial std of the depth-probe target depth (proxy for
+        #   scene complexity / parallax difficulty in the current batch).
+        # warp_valid/boundary/reveal = region mask fractions from completion.
+        depth_std_meter = AverageMeter()
+        depth_cv_meter = AverageMeter()
+        warp_valid_meter = AverageMeter()
+        warp_boundary_meter = AverageMeter()
+        warp_reveal_meter = AverageMeter()
+        canvas_valid_meter = AverageMeter()
+        canvas_oov_meter = AverageMeter()
+        canvas_boundary_meter = AverageMeter()
+        canvas_beta_valid_meter = AverageMeter()
+        canvas_beta_boundary_meter = AverageMeter()
+        canvas_beta_oov_meter = AverageMeter()
+        canvas_input_norm_ratio_meter = AverageMeter()
+        canvas_warp_norm_meter = AverageMeter()
+        canvas_mask_token_norm_meter = AverageMeter()
+        canvas_mask_embed_norm_meter = AverageMeter()
+        canvas_type_embed_norm_meter = AverageMeter()
+        layer_loss_meters = [AverageMeter() for _ in range(4)]
         # Phase R diagnostics (TCR design section 3.6). Cycle loss is the
         # primary reversibility signal; drift_from_prev is the identity-
         # collapse early-warning indicator.
@@ -2566,6 +2732,7 @@ def main(args, resume_preempt=False):
                     local_states_canon,
                     local_actions_window,
                     local_intrinsics_window,
+                    rollout_step=0,
                 ):
                     """Predictor forward pass with explicit, pre-canonicalized
                     trajectory tensors.
@@ -2590,11 +2757,35 @@ def main(args, resume_preempt=False):
                     """
                     h_context_step = torch.cat(step_context_latents, dim=1)
                     B_sz = h_context_step.shape[0]
-                    future_tokens = predictor_ref.future_mask_token.to(
-                        device=h_context_step.device,
-                        dtype=h_context_step.dtype,
-                    )
-                    future_tokens = future_tokens.expand(B_sz, HW, -1)
+                    if target_slot_mode == "canvas_first" and hasattr(predictor_ref, "build_target_canvas_inputs"):
+                        canvas_inputs = predictor_ref.build_target_canvas_inputs(
+                            h_context_step,
+                            local_states_canon,
+                            local_actions_window,
+                            local_intrinsics_window,
+                        )
+                        boundary_canvas = _rotation_unseen_boundary_mask(
+                            predictor_ref,
+                            local_states_canon,
+                            local_intrinsics_window,
+                            HW,
+                            h_context_step.dtype,
+                            intermediate_unseen_boundary_band,
+                        )
+                        future_tokens = predictor_ref.prepare_canvas_slot(
+                            warped_context_raw=canvas_inputs["warped_context_raw"],
+                            valid_mask=canvas_inputs["valid_mask"],
+                            oov_mask=canvas_inputs["oov_mask"],
+                            boundary_mask=boundary_canvas,
+                            confidence_mask=canvas_inputs["confidence_mask"],
+                            rollout_step=rollout_step,
+                        )
+                    else:
+                        future_tokens = predictor_ref.future_mask_token.to(
+                            device=h_context_step.device,
+                            dtype=h_context_step.dtype,
+                        )
+                        future_tokens = future_tokens.expand(B_sz, HW, -1)
                     h_predictor_input = torch.cat([h_context_step, future_tokens], dim=1)
                     preds, _, delta_preds, fsq_logits, warped_ctx_raw = predictor(
                         h_predictor_input,
@@ -2630,6 +2821,7 @@ def main(args, resume_preempt=False):
                         local_states,
                         local_actions,
                         local_intrinsics,
+                        rollout_step=max(0, target_tubelet_idx - len(step_context_latents)),
                     )
 
                 def loss_fn(
@@ -2668,6 +2860,7 @@ def main(args, resume_preempt=False):
                     tw = None
                     if token_weights is not None:
                         tw = token_weights.to(device=preds.device, dtype=preds.dtype)
+                        tw = tw.reshape(tw.shape[0], -1, 1)
                         tw = tw / tw.mean().clamp_min(1.0e-6)
                     if unseen_boundary_mask is not None:
                         unseen_boundary_mask = unseen_boundary_mask.to(
@@ -2741,6 +2934,8 @@ def main(args, resume_preempt=False):
                     corrector_layer_stats = None  # captured at rollout_step=0 only
                     completion_losses = []
                     completion_region_stats = []
+                    warp_diag_stats = []    # P0.6: depth_std per rollout step
+                    layer_loss_stats = []  # P0.5: per-layer L1 per rollout step
                     # Phase R: K=1 cycle loss + drift_from_prev diagnostic
                     # (TCR design section 3.4 / 3.6). Both populated only at
                     # rollout_step=0 within the loop, since the pilot is K=1.
@@ -2762,8 +2957,50 @@ def main(args, resume_preempt=False):
                             local_states_step,
                             local_actions_step,
                             local_intrinsics_step,
+                            rollout_step=rollout_step,
                         )
+                        if target_slot_mode == "canvas_first":
+                            _canvas_diag = getattr(predictor_ref, "_last_canvas_diag", None)
+                            if _canvas_diag is not None:
+                                canvas_valid_meter.update(float(_canvas_diag["valid_frac"]))
+                                canvas_oov_meter.update(float(_canvas_diag["oov_frac"]))
+                                canvas_boundary_meter.update(float(_canvas_diag["boundary_frac"]))
+                                canvas_beta_valid_meter.update(float(_canvas_diag["beta_valid"]))
+                                canvas_beta_boundary_meter.update(float(_canvas_diag["beta_boundary"]))
+                                canvas_beta_oov_meter.update(float(_canvas_diag["beta_oov"]))
+                                canvas_input_norm_ratio_meter.update(float(_canvas_diag["input_norm_ratio"]))
+                                canvas_warp_norm_meter.update(float(_canvas_diag["warp_norm"]))
+                                canvas_mask_token_norm_meter.update(float(_canvas_diag["mask_token_norm"]))
+                                canvas_mask_embed_norm_meter.update(float(_canvas_diag["mask_embed_norm"]))
+                                canvas_type_embed_norm_meter.update(float(_canvas_diag["type_embed_norm"]))
                         h_tgt_this = h_target_tubelets[target_tubelet_idx]
+                        _incoming_action_idx = max(0, target_tubelet_idx - 1)
+                        _incoming_action = actions[:, _incoming_action_idx]
+                        _outgoing_action = actions[:, target_tubelet_idx]
+                        with torch.no_grad():
+                            _t_in = _incoming_action[..., :3]
+                            _t_out = _outgoing_action[..., :3]
+                            _t_in_norm = _t_in.norm(dim=-1)
+                            _t_delta = (_t_in - _t_out).norm(dim=-1)
+                            _q_in = F.normalize(_incoming_action[..., 3:7], dim=-1)
+                            _q_out = F.normalize(_outgoing_action[..., 3:7], dim=-1)
+                            _q_dot = (_q_in * _q_out).sum(dim=-1).abs().clamp(max=1.0)
+                            action_in_norm_meter.update(
+                                float(_t_in_norm.mean().item())
+                            )
+                            action_out_norm_meter.update(
+                                float(_t_out.norm(dim=-1).mean().item())
+                            )
+                            action_trans_cos_meter.update(
+                                float(F.cosine_similarity(_t_in, _t_out, dim=-1, eps=1.0e-6).mean().item())
+                            )
+                            action_trans_delta_meter.update(float(_t_delta.mean().item()))
+                            action_trans_ratio_meter.update(
+                                float((_t_delta.mean() / _t_in_norm.mean().clamp_min(1.0e-6)).item())
+                            )
+                            action_rot_delta_meter.update(
+                                float((2.0 * torch.acos(_q_dot)).mean().item())
+                            )
                         unseen_boundary_mask = None
                         completion_masks = None
                         if intermediate_supervision_enabled:
@@ -2806,22 +3043,124 @@ def main(args, resume_preempt=False):
                                         "disoccluded": torch.zeros_like(boundary),
                                     }
 
-                        # Motion weighting: action at the step being predicted
-                        # is what the predictor must actually resolve. Weights
-                        # are normalized to mean=1 per batch so loss scale
-                        # tracks the unweighted baseline when motion is uniform.
+                        # Motion weighting: the *incoming* action into the
+                        # target step is actions[:, target_tubelet_idx - 1]
+                        # (dataset convention: actions[t] = t → t+1; the last
+                        # slot is zero-padded). Using target_tubelet_idx would
+                        # read the outgoing (zero) action, not the motion the
+                        # predictor must resolve.
                         if motion_weighted:
                             sample_w = _motion_sample_weights(
-                                actions[:, target_tubelet_idx],
+                                _incoming_action,
                                 mode=motion_weight_mode,
                                 alpha=motion_weight_alpha,
                             ).detach()
                         else:
                             sample_w = None
 
+                        # 1.4: build pred_final — the blended prediction used for
+                        # the main loss, self-feed, corrector, and cycle rollout.
+                        #
+                        # When completion_in_rollout=True and the completion head
+                        # is available with a region mask, we compute comp_preds
+                        # once here and blend:
+                        #   pred_final = raw*(1-M) + comp*M
+                        # where M = (disoccluded + boundary_weight*boundary).clamp(0,1).
+                        #
+                        # When the flag is off (default), pred_final == preds_next
+                        # and the completion head remains a side-branch auxiliary
+                        # loss only (backward-compatible).
+                        #
+                        # comp_preds_cached is set here if we compute it early so
+                        # the completion-loss block below can reuse it without a
+                        # second forward pass through completion_refine.
+                        comp_preds_cached = None
+                        comp_weights_cached = None
+                        pred_final = preds_next
+                        _alpha_now = 0.0  # initialised here; overwritten below when in_rollout
+                        # Ramped alpha for E6: 0 → blend_alpha over ramp_epochs.
+                        if completion_blend_alpha_ramp_epochs > 0:
+                            _alpha_now = completion_blend_alpha * min(
+                                1.0, epoch / max(1, completion_blend_alpha_ramp_epochs)
+                            )
+                        else:
+                            _alpha_now = completion_blend_alpha
+                        # Delayed self-feed for E7: use preds_next (not pred_final)
+                        # for rollout context until selffeed_delay_epochs is reached.
+                        _selffeed_pred_final = (
+                            completion_in_rollout
+                            and epoch >= completion_selffeed_delay_epochs
+                        )
+                        if (
+                            completion_in_rollout
+                            and use_posthoc_completion_blend
+                            and completion_enabled
+                            and use_completion_head
+                            and completion_masks is not None
+                            and hasattr(predictor_ref, "complete_predictions")
+                        ):
+                            # Build real mask_feats from OOV side-channel.
+                            # Channel order: [valid, oov, boundary, disoccluded].
+                            _oov_raw = getattr(predictor_ref, "_last_warp_oov_mask", None)
+                            if _oov_raw is not None:
+                                _oov_flat = _oov_raw.reshape(
+                                    _oov_raw.shape[0], -1
+                                ).float().to(device=preds_next.device, dtype=preds_next.dtype)
+                                _oov_flat = _oov_flat.unsqueeze(-1)  # (B, HW, 1)
+                            else:
+                                _oov_flat = preds_next.new_zeros(preds_next.shape[0], preds_next.shape[1], 1)
+                            _valid_flat = 1.0 - _oov_flat
+                            _bnd_flat = completion_masks["boundary"].to(
+                                device=preds_next.device, dtype=preds_next.dtype
+                            ).reshape(preds_next.shape[0], -1, 1)
+                            _dis_flat = completion_masks["disoccluded"].to(
+                                device=preds_next.device, dtype=preds_next.dtype
+                            ).reshape(preds_next.shape[0], -1, 1)
+                            _mask_feats = torch.cat(
+                                [_valid_flat, _oov_flat, _bnd_flat, _dis_flat], dim=-1
+                            )  # (B, HW, 4)
+                            # Build action_embed from incoming raw action (B, action_dim).
+                            _in_act = _incoming_action.to(
+                                device=preds_next.device, dtype=preds_next.dtype
+                            )
+                            _action_embed = _in_act
+                            comp_preds_cached = predictor_ref.complete_predictions(
+                                preds_next,
+                                warped_context_raw=warped_ctx_raw,
+                                mask_feats=_mask_feats,
+                                action_embed=_action_embed,
+                            )
+                            _oov_mask = _oov_flat.squeeze(-1)
+                            _bnd_mask = _bnd_flat.squeeze(-1)
+                            if completion_use_region_blend_alpha:
+                                M = (_oov_mask + _bnd_mask).clamp(0.0, 1.0)
+                                _alpha_map = (
+                                    completion_oov_blend_alpha * _oov_mask
+                                    + completion_boundary_blend_alpha * _bnd_mask
+                                ).clamp(0.0, max(completion_oov_blend_alpha, completion_boundary_blend_alpha))
+                            else:
+                                M = (_oov_mask + 0.25 * _bnd_mask).clamp(0.0, 1.0)
+                                _alpha_map = _alpha_now * M
+                            comp_weights_cached = M
+                            _delta = comp_preds_cached - preds_next
+                            pred_final = preds_next + _alpha_map.unsqueeze(-1) * _delta
+                            # Birth diagnostics (detached, no grad).
+                            with torch.no_grad():
+                                birth_delta_norm_meter.update(
+                                    float(_delta.abs().mean().item()))
+                                birth_action_norm_meter.update(
+                                    float(_action_embed.norm(dim=-1).mean().item()))
+                                birth_mask_norm_meter.update(
+                                    float(_mask_feats.abs().mean().item()))
+                                birth_M_mean_meter.update(float(M.mean().item()))
+                                birth_oov_mean_meter.update(
+                                    float(_oov_flat.mean().item()))
+                                birth_bnd_mean_meter.update(
+                                    float(_bnd_flat.mean().item()))
+
                         step_losses.append(
                             loss_fn(
-                                preds_next,
+                                pred_final,
                                 h_tgt_this,
                                 sample_weights=sample_w,
                                 warped_context_raw=warped_ctx_raw,
@@ -2834,29 +3173,65 @@ def main(args, resume_preempt=False):
                             and completion_masks is not None
                             and hasattr(predictor_ref, "complete_predictions")
                         ):
-                            # NOTE: this branch must be deterministic across
-                            # iterations or DDP's reducer fires the
-                            # ``ready twice`` error on ``completion_refine``
-                            # parameters. The previous implementation skipped
-                            # the call entirely when ``comp_weights.sum() == 0``,
-                            # making the graph data-dependent — incompatible
-                            # with both ``static_graph=True`` and the
-                            # ``find_unused_parameters=True`` reducer when the
-                            # parameter is touched in multi-step rollout.
-                            #
-                            # Always call ``complete_predictions`` and append
-                            # the loss with the same ``comp_weights`` mask;
-                            # the loss naturally contributes zero when no
-                            # boundary/disoccluded tokens are present, but
-                            # the parameter usage pattern stays static.
-                            comp_weights = (
-                                completion_masks["disoccluded"]
-                                + completion_boundary_weight * completion_masks["boundary"]
-                            ).to(device=preds_next.device, dtype=preds_next.dtype)
-                            comp_preds = predictor_ref.complete_predictions(
-                                preds_next,
-                                warped_context_raw=warped_ctx_raw,
-                            )
+                            # Always call complete_predictions to keep parameter
+                            # usage static across iterations (DDP compatibility).
+                            # Reuse cached result from in_rollout path if available.
+                            if comp_weights_cached is not None:
+                                comp_weights = comp_weights_cached
+                                comp_preds = comp_preds_cached
+                            else:
+                                # Aux-only path: build real mask_feats + raw action.
+                                _oov_raw_aux = getattr(predictor_ref, "_last_warp_oov_mask", None)
+                                if _oov_raw_aux is not None:
+                                    _oov_aux = _oov_raw_aux.reshape(
+                                        _oov_raw_aux.shape[0], -1
+                                    ).float().to(
+                                        device=preds_next.device, dtype=preds_next.dtype
+                                    ).unsqueeze(-1)
+                                else:
+                                    _oov_aux = preds_next.new_zeros(
+                                        preds_next.shape[0], preds_next.shape[1], 1
+                                    )
+                                _bnd_aux = completion_masks["boundary"].to(
+                                    device=preds_next.device, dtype=preds_next.dtype
+                                ).reshape(preds_next.shape[0], -1).unsqueeze(-1)
+                                _dis_aux = completion_masks["disoccluded"].to(
+                                    device=preds_next.device, dtype=preds_next.dtype
+                                ).reshape(preds_next.shape[0], -1).unsqueeze(-1)
+                                _mask_feats_aux = torch.cat(
+                                    [1.0 - _oov_aux, _oov_aux, _bnd_aux, _dis_aux], dim=-1
+                                )
+                                _in_act_aux = _incoming_action.to(
+                                    device=preds_next.device, dtype=preds_next.dtype
+                                )
+                                comp_preds = predictor_ref.complete_predictions(
+                                    preds_next,
+                                    warped_context_raw=warped_ctx_raw,
+                                    mask_feats=_mask_feats_aux,
+                                    action_embed=_in_act_aux,
+                                )
+                                # OOV-centric aux weight (consistent with in_rollout M).
+                                comp_weights = (
+                                    _oov_aux.squeeze(-1)
+                                    + completion_boundary_weight * _bnd_aux.squeeze(-1)
+                                ).clamp(0.0, 1.0).to(
+                                    device=preds_next.device, dtype=preds_next.dtype
+                                )
+                                # Birth diagnostics for aux path.
+                                with torch.no_grad():
+                                    _delta_aux = comp_preds - preds_next
+                                    birth_delta_norm_meter.update(
+                                        float(_delta_aux.abs().mean().item()))
+                                    birth_action_norm_meter.update(
+                                        float(_in_act_aux.norm(dim=-1).mean().item()))
+                                    birth_mask_norm_meter.update(
+                                        float(_mask_feats_aux.abs().mean().item()))
+                                    birth_M_mean_meter.update(
+                                        float(comp_weights.mean().item()))
+                                    birth_oov_mean_meter.update(
+                                        float(_oov_aux.mean().item()))
+                                    birth_bnd_mean_meter.update(
+                                        float(_bnd_aux.mean().item()))
                             completion_losses.append(
                                 loss_fn(
                                     comp_preds,
@@ -2866,6 +3241,30 @@ def main(args, resume_preempt=False):
                                 )
                             )
                             with torch.no_grad():
+                                _M = comp_weights.to(device=preds_next.device, dtype=preds_next.dtype).reshape(
+                                    preds_next.shape[0], -1
+                                )
+                                _den = _M.sum().clamp_min(1.0e-6)
+                                _raw_tok = (preds_next.detach() - h_tgt_this.detach()).abs().mean(dim=-1)
+                                _comp_tok = (comp_preds.detach() - h_tgt_this.detach()).abs().mean(dim=-1)
+                                _final_tok = (pred_final.detach() - h_tgt_this.detach()).abs().mean(dim=-1)
+                                birth_raw_err_meter.update(float((_raw_tok * _M).sum().div(_den).item()))
+                                birth_comp_err_meter.update(float((_comp_tok * _M).sum().div(_den).item()))
+                                birth_final_err_meter.update(float((_final_tok * _M).sum().div(_den).item()))
+                                _D = preds_next.shape[-1] // n_hierarchical_layers
+                                _raw_layers = preds_next.detach().split(_D, dim=-1)
+                                _comp_layers = comp_preds.detach().split(_D, dim=-1)
+                                _final_layers = pred_final.detach().split(_D, dim=-1)
+                                _tgt_layers = h_tgt_this.detach().split(_D, dim=-1)
+                                for _li, (_rp, _cp, _fp, _tt) in enumerate(zip(
+                                    _raw_layers, _comp_layers, _final_layers, _tgt_layers
+                                )):
+                                    _r = (_rp - _tt).abs().mean(dim=-1)
+                                    _c = (_cp - _tt).abs().mean(dim=-1)
+                                    _f = (_fp - _tt).abs().mean(dim=-1)
+                                    birth_raw_layer_meters[_li].update(float((_r * _M).sum().div(_den).item()))
+                                    birth_comp_layer_meters[_li].update(float((_c * _M).sum().div(_den).item()))
+                                    birth_final_layer_meters[_li].update(float((_f * _M).sum().div(_den).item()))
                                 completion_region_stats.append(
                                     {
                                         "visible": float(completion_masks["visible"].mean().detach().item()),
@@ -2873,6 +3272,29 @@ def main(args, resume_preempt=False):
                                         "disoccluded": float(completion_masks["disoccluded"].mean().detach().item()),
                                     }
                                 )
+
+                        # P0.5: per-layer prediction L1 diagnostic (no grad,
+                        # cheap — just split the concat dim into n_layers).
+                        with torch.no_grad():
+                            if n_hierarchical_layers > 1:
+                                _L = n_hierarchical_layers
+                                _D = preds_next.shape[-1] // _L
+                                _p = preds_next.detach().reshape(-1, _L, _D)
+                                _t = h_tgt_this.detach().reshape(-1, _L, _D)
+                                _ll = (_p - _t).abs().mean(dim=(0, 2))  # (_L,)
+                                layer_loss_stats.append(
+                                    [float(_ll[i].item()) for i in range(_L)]
+                                )
+
+                        # P0.6: depth_std + depth_cv diagnostics.
+                        with torch.no_grad():
+                            _td = getattr(predictor_ref, "_last_target_depth", None)
+                            if _td is not None:
+                                _td_flat = _td.detach().flatten(1)  # (B, HW)
+                                _dstd = float(_td_flat.std(dim=1).mean().item())
+                                _dmean = float(_td_flat.mean(dim=1).mean().item())
+                                _dcv = _dstd / max(_dmean, 1e-6)
+                                warp_diag_stats.append({"depth_std": _dstd, "depth_cv": _dcv})
 
                         if use_delta_head and delta_preds_next is not None:
                             if prev_target_latents is None:
@@ -2977,10 +3399,13 @@ def main(args, resume_preempt=False):
                                 # invertible. Teacher-forced seed is a
                                 # diagnostic-only ablation (R4).
                                 if cycle_seed_mode == "predicted":
+                                    # Use pred_final: the completion-blended
+                                    # latent when completion_in_rollout=True,
+                                    # else == preds_next (backward-compatible).
                                     z_seed = (
-                                        preds_next.detach()
+                                        pred_final.detach()
                                         if cycle_detach_forward
-                                        else preds_next
+                                        else pred_final
                                     )
                                 else:
                                     z_seed = h_target_tubelets[t_end].detach()
@@ -3211,16 +3636,18 @@ def main(args, resume_preempt=False):
                                 device=preds_next.device, dtype=torch.long,
                             )
                             _pose_mag = torch.linalg.norm(
-                                actions[:, target_tubelet_idx, :3], dim=-1
+                                _incoming_action[:, :3], dim=-1
                             )
                             # C1 frozen-predictor: detach to fully cut graph;
                             # only corrector params receive gradient.
                             # C2 joint: keep graph, predictor learns to
                             # produce correctable latents.
+                            # Use pred_final (completion-blended when
+                            # completion_in_rollout=True, else == preds_next).
                             _corr_input = (
-                                preds_next.detach()
+                                pred_final.detach()
                                 if corrector_mode == "frozen_predictor"
-                                else preds_next
+                                else pred_final
                             )
                             z_corr = corrector(_corr_input, _step_idx, _pose_mag)
                             corrector_step_losses.append(
@@ -3284,9 +3711,16 @@ def main(args, resume_preempt=False):
                             # When the corrector is on, the self-fed slot is
                             # the corrected prediction (paper claim: the
                             # corrector applies at inference time on the
-                            # rollout slot). When off, fall back to the raw
-                            # predicted latent.
-                            _next_slot = z_corr if corrector is not None else preds_next
+                            # rollout slot). When off, fall back to pred_final
+                            # Use pred_final for self-feed when in_rollout is on
+                            # and the delay period has passed (E7 delayed selffeed).
+                            # Before delay: self-feed preds_next to prevent instability.
+                            _slot_for_selffeed = (
+                                pred_final
+                                if _selffeed_pred_final
+                                else preds_next
+                            )
+                            _next_slot = z_corr if corrector is not None else _slot_for_selffeed
                             # A3 input noise injection: per-layer scale-aware
                             # Gaussian perturbation on the self-fed slot.
                             # Noise scale = rollout_noise_std * per-channel
@@ -3338,6 +3772,21 @@ def main(args, resume_preempt=False):
                                 key: float(np.mean([s[key] for s in completion_region_stats]))
                                 for key in ("visible", "boundary", "disoccluded")
                             }
+
+                    # P0.5/P0.6: aggregate per-layer and depth diagnostics.
+                    warp_diag_means = None
+                    layer_loss_means = None
+                    if warp_diag_stats:
+                        warp_diag_means = {
+                            "depth_std": float(np.mean([s["depth_std"] for s in warp_diag_stats])),
+                            "depth_cv": float(np.mean([s["depth_cv"] for s in warp_diag_stats])),
+                        }
+                    if layer_loss_stats:
+                        _n = len(layer_loss_stats[0])
+                        layer_loss_means = [
+                            float(np.mean([s[i] for s in layer_loss_stats]))
+                            for i in range(_n)
+                        ]
 
                     # Phase C — aggregate corrector closed-loop match +
                     # denoise losses. Closed-loop match is the primary
@@ -3423,6 +3872,8 @@ def main(args, resume_preempt=False):
                     _drift_value,
                     _completion_loss_value,
                     completion_region_means,
+                    warp_diag_means,
+                    layer_loss_means,
                 )
 
             (
@@ -3430,6 +3881,7 @@ def main(args, resume_preempt=False):
                 _loss_corr_step, _loss_corr_denoise, _corr_layer_stats,
                 _loss_cycle, _loss_composition, _drift_from_prev,
                 _loss_completion, _completion_region_means,
+                _warp_diag_means, _layer_loss_means,
             ), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
@@ -3460,6 +3912,14 @@ def main(args, resume_preempt=False):
                 completion_visible_meter.update(_completion_region_means["visible"])
                 completion_boundary_meter.update(_completion_region_means["boundary"])
                 completion_disoccluded_meter.update(_completion_region_means["disoccluded"])
+            # P0.5/P0.6: update per-layer and depth diagnostics.
+            if _warp_diag_means is not None:
+                depth_std_meter.update(_warp_diag_means["depth_std"])
+                depth_cv_meter.update(_warp_diag_means["depth_cv"])
+            if _layer_loss_means is not None:
+                for _li, _lv in enumerate(_layer_loss_means):
+                    if _li < len(layer_loss_meters):
+                        layer_loss_meters[_li].update(_lv)
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)
             data_elapsed_time_meter.update(data_elapsed_time_ms)
@@ -3501,8 +3961,65 @@ def main(args, resume_preempt=False):
                                 completion_disoccluded_meter.avg,
                             )
                         )
+                    _birth_log = ""
+                    if completion_enabled and birth_delta_norm_meter.count > 0:
+                        _birth_raw_layers = "/".join("%.4f" % m.avg for m in birth_raw_layer_meters)
+                        _birth_comp_layers = "/".join("%.4f" % m.avg for m in birth_comp_layer_meters)
+                        _birth_final_layers = "/".join("%.4f" % m.avg for m in birth_final_layer_meters)
+                        _birth_log = (
+                            " [birth_delta: %.4f act: %.4f msk: %.4f M: %.3f oov: %.3f bnd: %.3f act_in/out: %.4f/%.4f act_cos: %.3f act_delta: %.4f act_ratio: %.3f act_rot: %.4f in_roll: %s alpha: %.3f birth_err raw/comp/final: %.4f/%.4f/%.4f birth_L raw:%s comp:%s final:%s]"
+                            % (
+                                birth_delta_norm_meter.avg,
+                                birth_action_norm_meter.avg,
+                                birth_mask_norm_meter.avg,
+                                birth_M_mean_meter.avg,
+                                birth_oov_mean_meter.avg,
+                                birth_bnd_mean_meter.avg,
+                                action_in_norm_meter.avg,
+                                action_out_norm_meter.avg,
+                                action_trans_cos_meter.avg,
+                                action_trans_delta_meter.avg,
+                                action_trans_ratio_meter.avg,
+                                action_rot_delta_meter.avg,
+                                str(completion_in_rollout),
+                                (completion_blend_alpha * min(1.0, epoch / max(1, completion_blend_alpha_ramp_epochs))
+                                 if completion_blend_alpha_ramp_epochs > 0
+                                 else completion_blend_alpha) if completion_in_rollout else 0.0,
+                                birth_raw_err_meter.avg,
+                                birth_comp_err_meter.avg,
+                                birth_final_err_meter.avg,
+                                _birth_raw_layers,
+                                _birth_comp_layers,
+                                _birth_final_layers,
+                            )
+                        )
+                    _diag_log = ""
+                    if depth_std_meter.count > 0:
+                        _diag_log += " [depth_std: %.3f cv: %.3f]" % (
+                            depth_std_meter.avg, depth_cv_meter.avg
+                        )
+                    if layer_loss_meters[0].count > 0:
+                        _ll_str = "/".join("%.4f" % m.avg for m in layer_loss_meters)
+                        _diag_log += " [layer_L1: %s]" % _ll_str
+                    if target_slot_mode == "canvas_first" and canvas_valid_meter.count > 0:
+                        _diag_log += (
+                            " [canvas valid/oov/bnd: %.3f/%.3f/%.3f beta: %.3f/%.3f/%.3f norm_ratio: %.3f warp/mask/mskemb/typeemb: %.3f/%.3f/%.3f/%.3f]"
+                            % (
+                                canvas_valid_meter.avg,
+                                canvas_oov_meter.avg,
+                                canvas_boundary_meter.avg,
+                                canvas_beta_valid_meter.avg,
+                                canvas_beta_boundary_meter.avg,
+                                canvas_beta_oov_meter.avg,
+                                canvas_input_norm_ratio_meter.avg,
+                                canvas_warp_norm_meter.avg,
+                                canvas_mask_token_norm_meter.avg,
+                                canvas_mask_embed_norm_meter.avg,
+                                canvas_type_embed_norm_meter.avg,
+                            )
+                        )
                     logger.info(
-                        "[%d, %5d] loss: %.3f [pred: %.3f ctx: %.3f step1: %.3f step2: %.3f]%s%s%s "
+                        "[%d, %5d] loss: %.3f [pred: %.3f ctx: %.3f step1: %.3f step2: %.3f]%s%s%s%s%s "
                         "[wd: %.2e] [lr: %.2e] "
                         "[mem: %.2e] "
                         "[iter: %.1f ms] [gpu: %.1f ms] [data: %.1f ms]"
@@ -3513,6 +4030,8 @@ def main(args, resume_preempt=False):
                             _corr_log,
                             _cycle_log,
                             _completion_log,
+                            _birth_log,
+                            _diag_log,
                             _new_wd, _new_lr,
                             torch.cuda.max_memory_allocated() / 1024.0**2,
                             iter_time_meter.avg,
@@ -3547,6 +4066,14 @@ def main(args, resume_preempt=False):
             training_stats["completion_visible_frac"].append(completion_visible_meter.avg)
             training_stats["completion_boundary_frac"].append(completion_boundary_meter.avg)
             training_stats["completion_disoccluded_frac"].append(completion_disoccluded_meter.avg)
+        if target_slot_mode == "canvas_first":
+            training_stats["canvas_valid_frac"].append(canvas_valid_meter.avg)
+            training_stats["canvas_oov_frac"].append(canvas_oov_meter.avg)
+            training_stats["canvas_boundary_frac"].append(canvas_boundary_meter.avg)
+            training_stats["canvas_beta_valid"].append(canvas_beta_valid_meter.avg)
+            training_stats["canvas_beta_boundary"].append(canvas_beta_boundary_meter.avg)
+            training_stats["canvas_beta_oov"].append(canvas_beta_oov_meter.avg)
+            training_stats["canvas_input_norm_ratio"].append(canvas_input_norm_ratio_meter.avg)
         if drift_from_prev_meter.count > 0:
             training_stats["drift_from_prev"].append(drift_from_prev_meter.avg)
         if corrector is not None:

@@ -43,6 +43,112 @@ except Exception:  # ModuleNotFoundError when GWM root is not on sys.path.
     FSQCategoricalHead = None  # type: ignore
 
 
+class FourLayerBirthHead(nn.Module):
+    """Per-layer masked residual completion head for CameraAC-LAM-4L.
+
+    Replaces the single flattened ``completion_refine`` MLP that operated over
+    all 4 layers concatenated (``Linear(8D, hidden, 4D)``).  That design is
+    both structurally wrong (treats layer identity as spatial position) and
+    expensive for ViT-G where D can be 1536+.
+
+    Architecture
+    ------------
+    Shared cross-layer conditioner:
+        input: [z_pred pooled over HW  (4D) | action_embed (action_dim) | mask_stats (n_mask_feats)]
+        output: cond  (hidden)  — broadcast to every spatial position
+
+    Per-layer head (× n_layers):
+        input: [z_pred_l (D) | z_mem_l (D) | cond (hidden) | mask_feats_per_token (n_mask_feats)]
+        output: residual_l (D)
+
+    Final output: concat(residual_l, ...) shape (B, HW, n_layers * D)
+
+    Gate
+    ----
+    ``completion_gate`` (scalar, init 0.0 → tanh(0) = 0): full no-op at
+    step 0.  The caller adds ``tanh(gate) * output`` to ``z_pred``.
+    """
+
+    def __init__(
+        self,
+        layer_dim: int,
+        action_dim: int,
+        n_layers: int = 4,
+        n_mask_feats: int = 4,
+        hidden: int = 512,
+        n_conditioner_layers: int = 2,
+        n_head_layers: int = 2,
+    ):
+        super().__init__()
+        self.n_layers = n_layers
+        self.layer_dim = layer_dim
+
+        cond_in = n_layers * layer_dim + action_dim + n_mask_feats
+        cond_layers: list[nn.Module] = [nn.Linear(cond_in, hidden, bias=True), nn.GELU()]
+        for _ in range(n_conditioner_layers - 1):
+            cond_layers.extend([nn.Linear(hidden, hidden, bias=True), nn.GELU()])
+        self.cross_layer_cond = nn.Sequential(*cond_layers)
+
+        head_in = 2 * layer_dim + hidden + n_mask_feats
+        heads = []
+        for _ in range(n_layers):
+            h_layers: list[nn.Module] = [nn.Linear(head_in, hidden, bias=True), nn.GELU()]
+            for _ in range(n_head_layers - 1):
+                h_layers.extend([nn.Linear(hidden, hidden, bias=True), nn.GELU()])
+            h_layers.append(nn.Linear(hidden, layer_dim, bias=True))
+            heads.append(nn.Sequential(*h_layers))
+        self.heads = nn.ModuleList(heads)
+
+        self.completion_gate = nn.Parameter(torch.zeros(()))
+        # Zero-init the final residual projection in each per-layer head so
+        # the birth head starts as a strict no-op: z_final = z_base + 0.
+        # This prevents randomly-initialized residuals from destabilizing a
+        # pre-trained model when completion is first turned on.
+        for head in self.heads:
+            last_linear = head[-1]
+            nn.init.zeros_(last_linear.weight)
+            nn.init.zeros_(last_linear.bias)
+
+    def forward(
+        self,
+        z_pred: torch.Tensor,
+        z_mem: torch.Tensor,
+        mask_feats: torch.Tensor,
+        action_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            z_pred: (B, HW, n_layers * D)  raw predictor output
+            z_mem:  (B, HW, n_layers * D)  warped/transported context features
+                    (may be all-zeros when warp is off)
+            mask_feats: (B, HW, n_mask_feats)  per-token region masks
+                        [valid, boundary, reveal, transport_conf]
+            action_embed: (B, action_dim)  incoming relative action features
+
+        Returns:
+            delta: (B, HW, n_layers * D) — caller applies
+                   ``pred + tanh(gate) * delta``
+        """
+        B, HW, _ = z_pred.shape
+        D = self.layer_dim
+
+        pred = z_pred.view(B, HW, self.n_layers, D)
+        mem = z_mem.view(B, HW, self.n_layers, D)
+
+        pooled = pred.mean(dim=1).reshape(B, self.n_layers * D)
+        mask_stats = mask_feats.mean(dim=1)
+        cond_in = torch.cat([pooled, action_embed, mask_stats], dim=-1)
+        cond = self.cross_layer_cond(cond_in)
+        cond = cond.unsqueeze(1).expand(B, HW, -1)
+
+        outs = []
+        for l_idx, head in enumerate(self.heads):
+            x = torch.cat([pred[:, :, l_idx], mem[:, :, l_idx], cond, mask_feats], dim=-1)
+            outs.append(head(x))
+
+        return torch.cat(outs, dim=-1)
+
+
 class CameraConditionedPredictorAC(nn.Module):
     """
     Camera-pose-conditioned predictor with V-JEPA 2.1 hierarchical output heads.
@@ -123,13 +229,23 @@ class CameraConditionedPredictorAC(nn.Module):
         use_completion_head=False,
         completion_head_depth=2,
         completion_head_ratio=2.0,
+        use_four_layer_birth_head=True,
+        completion_head_hidden=512,
+        completion_head_action_dim=None,
         use_fsq_head=False,
         fsq_total_code_axes=0,
         fsq_levels=0,
         warp_context_latents=False,
-        warp_context_padding_mode="border",
+        warp_context_padding_mode="zeros",
         warp_mode="auto",
         depth_probe_checkpoint=None,
+        target_slot_mode="mask",
+        canvas_beta_init_valid=0.0,
+        canvas_beta_init_boundary=0.0,
+        canvas_beta_init_oov=0.0,
+        canvas_use_mask_feat_embed=True,
+        canvas_use_token_type_embed=True,
+        canvas_use_target_step_embed=True,
         correspondence_bias_enabled=False,
         correspondence_bias_mode="rotation_homography",
         correspondence_bias_sigma_tokens=2.0,
@@ -151,6 +267,12 @@ class CameraConditionedPredictorAC(nn.Module):
         # tokens into the target frame's 24x24 grid before interleaving
         # conditioning tokens. See ``_warp_context_tokens``.
         self.warp_context_latents = bool(warp_context_latents)
+        _valid_padding_modes = ("border", "zeros", "reflection", "learned")
+        if warp_context_padding_mode not in _valid_padding_modes:
+            raise ValueError(
+                f"warp_context_padding_mode must be one of {_valid_padding_modes}; "
+                f"got {warp_context_padding_mode!r}."
+            )
         self.warp_context_padding_mode = str(warp_context_padding_mode)
         # Path B-lite Step 1 — resolve ``warp_mode`` (one of
         #   ``"off"``               -- no token warping,
@@ -289,6 +411,20 @@ class CameraConditionedPredictorAC(nn.Module):
         self.predict_all = predict_all
         self.n_hierarchical_layers = n_hierarchical_layers
         self.input_token_dim = embed_dim * n_hierarchical_layers
+        target_slot_mode = str(target_slot_mode).lower().strip()
+        if target_slot_mode not in ("mask", "canvas_first"):
+            raise ValueError(
+                f"target_slot_mode must be one of ('mask', 'canvas_first'); got {target_slot_mode!r}."
+            )
+        self.target_slot_mode = target_slot_mode
+        self.canvas_use_mask_feat_embed = bool(canvas_use_mask_feat_embed)
+        self.canvas_use_token_type_embed = bool(canvas_use_token_type_embed)
+        self.canvas_use_target_step_embed = bool(canvas_use_target_step_embed)
+        self._canvas_beta_init = (
+            float(canvas_beta_init_valid),
+            float(canvas_beta_init_boundary),
+            float(canvas_beta_init_oov),
+        )
         self.use_activation_checkpointing = use_activation_checkpointing
         self.init_std = init_std
 
@@ -475,6 +611,11 @@ class CameraConditionedPredictorAC(nn.Module):
         # ------------------------------------------------------------------ #
         act_layer_mlp = nn.SiLU if use_silu else nn.GELU
         self.future_mask_token = nn.Parameter(torch.zeros(1, 1, self.input_token_dim))
+        if self.target_slot_mode == "canvas_first":
+            self.canvas_beta_by_type = nn.Parameter(torch.tensor(self._canvas_beta_init, dtype=torch.float32))
+            self.canvas_mask_proj = nn.Linear(4, self.input_token_dim, bias=True)
+            self.canvas_type_embed = nn.Embedding(3, self.input_token_dim)
+            self.canvas_target_step_embed = nn.Embedding(max(1, num_frames // tubelet_size), self.input_token_dim)
         if n_hierarchical_layers == 1:
             self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         else:
@@ -593,28 +734,60 @@ class CameraConditionedPredictorAC(nn.Module):
             self.residual_refine = nn.Sequential(*layers)
             self.residual_gate = nn.Parameter(torch.tensor(0.01))
 
+        self.use_four_layer_birth_head = bool(use_four_layer_birth_head)
         if self.use_completion_head:
             completion_dim = int(n_hierarchical_layers) * int(out_embed_dim)
-            completion_hidden = int(completion_dim * completion_head_ratio)
-            layers = []
-            in_dim = completion_dim * 2
-            for _ in range(int(completion_head_depth)):
-                layers.extend(
-                    [
-                        nn.Linear(in_dim, completion_hidden, bias=True),
-                        nn.GELU(),
-                    ]
+            if self.use_four_layer_birth_head:
+                # P2: structured per-layer head.  action_dim falls back to the
+                # constructor's action_dim when not separately specified.
+                _birth_action_dim = int(
+                    completion_head_action_dim
+                    if completion_head_action_dim is not None
+                    else action_dim
                 )
-                in_dim = completion_hidden
-            layers.append(nn.Linear(in_dim, completion_dim, bias=True))
-            self.completion_refine = nn.Sequential(*layers)
-            self.completion_gate = nn.Parameter(torch.tensor(0.01))
+                _birth_hidden = int(completion_head_hidden)
+                self.completion_refine = FourLayerBirthHead(
+                    layer_dim=int(out_embed_dim),
+                    action_dim=_birth_action_dim,
+                    n_layers=int(n_hierarchical_layers),
+                    n_mask_feats=4,
+                    hidden=_birth_hidden,
+                    n_conditioner_layers=max(1, int(completion_head_depth) - 1),
+                    n_head_layers=int(completion_head_depth),
+                )
+                # completion_gate lives inside FourLayerBirthHead; expose as
+                # an attribute alias so legacy code that reads
+                # ``predictor_ref.completion_gate`` still works.
+                self.completion_gate = self.completion_refine.completion_gate
+            else:
+                # Legacy flat MLP path (backward compat, use_four_layer_birth_head=False).
+                completion_hidden = int(completion_dim * completion_head_ratio)
+                layers = []
+                in_dim = completion_dim * 2
+                for _ in range(int(completion_head_depth)):
+                    layers.extend(
+                        [
+                            nn.Linear(in_dim, completion_hidden, bias=True),
+                            nn.GELU(),
+                        ]
+                    )
+                    in_dim = completion_hidden
+                layers.append(nn.Linear(in_dim, completion_dim, bias=True))
+                self.completion_refine = nn.Sequential(*layers)
+                self.completion_gate = nn.Parameter(torch.tensor(0.01))
 
         # ------------------------------------------------------------------ #
         # Weight initialisation + block rescaling (mirrors ac_predictor.py)
         # ------------------------------------------------------------------ #
         self.apply(self._init_weights)
         trunc_normal_(self.future_mask_token, std=self.init_std)
+        if self.target_slot_mode == "canvas_first":
+            with torch.no_grad():
+                self.canvas_beta_by_type.copy_(torch.tensor(self._canvas_beta_init, dtype=self.canvas_beta_by_type.dtype))
+                self.canvas_mask_proj.weight.zero_()
+                self.canvas_mask_proj.bias.zero_()
+                self.canvas_type_embed.weight.zero_()
+                self.canvas_target_step_embed.weight.zero_()
         self._rescale_blocks()
 
         # Pre-compute and register the block-causal attention mask.
@@ -631,20 +804,106 @@ class CameraConditionedPredictorAC(nn.Module):
             )
         self.register_buffer("attn_mask", attn_mask, persistent=False)
 
+        # P0.4: learned unseen token for OOV warp regions.
+        # When ``warp_context_padding_mode='learned'``, positions that project
+        # outside the source frame grid are filled with this token instead of
+        # being border-replicated or left as zeros.  Shape (1, 1, input_token_dim)
+        # so it broadcasts to (B, HW_oov, D) after indexing.
+        # Registered as nn.Parameter (not a buffer) so the optimizer updates it.
+        if self.warp_context_padding_mode == "learned":
+            self.warp_unseen_token = nn.Parameter(
+                torch.zeros(1, 1, self.input_token_dim)
+            )
+            trunc_normal_(self.warp_unseen_token, std=0.02)
+        else:
+            self.warp_unseen_token = None
+        # Side-channel: last OOV mask written by _apply_learned_oov.
+        # Shape (B, gh, gw); None until first forward.
+        # Consumed by train.py to build mask_feats for FourLayerBirthHead.
+        self._last_warp_oov_mask: torch.Tensor | None = None
+        self._last_canvas_diag: dict | None = None
+
+    def _apply_learned_oov(
+        self,
+        warped_nchw: torch.Tensor,
+        src_xy_gs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Substitute ``warp_unseen_token`` into OOV (out-of-view) positions.
+
+        Args:
+            warped_nchw: ``(B, D, gh, gw)`` output of ``F.grid_sample`` with
+                ``padding_mode='zeros'``.  OOV positions are all-zero.
+            src_xy_gs: ``(B, gh, gw, 2)`` grid-sample coordinates in ``[-1,1]``.
+                Positions with ``|x| > 1`` or ``|y| > 1`` are OOV.
+
+        Returns:
+            ``warped_nchw`` with OOV positions replaced by ``warp_unseen_token``.
+            No-op when ``warp_unseen_token is None`` (padding_mode != 'learned').
+        """
+        B, D, gh, gw = warped_nchw.shape
+        # Catch both out-of-range coords AND NaN projections (PyTorch documents
+        # that NaN grid values are treated as -1, silently sampling the top-left
+        # corner rather than being assigned the unseen token).
+        finite = torch.isfinite(src_xy_gs).all(dim=-1)          # (B, gh, gw)
+        oov = (~finite) | (src_xy_gs.abs() > 1.0).any(dim=-1)   # (B, gh, gw)
+        # Expose for downstream mask_feats construction (detached — diagnostic
+        # only, must not carry gradients into the loss through this path).
+        self._last_warp_oov_mask = oov.detach()
+        if self.warp_unseen_token is None:
+            return warped_nchw
+        if not oov.any():
+            return warped_nchw
+        unseen = self.warp_unseen_token.to(
+            device=warped_nchw.device, dtype=warped_nchw.dtype
+        )  # (1, 1, input_token_dim) — slice to D then broadcast
+        unseen_d = unseen[..., :D].reshape(1, D, 1, 1).expand(B, D, gh, gw)
+        oov_mask = oov.unsqueeze(1).expand(B, D, gh, gw)  # (B, D, gh, gw)
+        return torch.where(oov_mask, unseen_d, warped_nchw)
+
     def complete_predictions(
         self,
         preds: torch.Tensor,
         warped_context_raw: torch.Tensor | None = None,
+        mask_feats: torch.Tensor | None = None,
+        action_embed: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply the completion-route residual used for unseen/boundary tokens."""
+        """Apply the completion-route residual for unseen/boundary tokens.
+
+        Dispatches to ``FourLayerBirthHead`` when ``use_four_layer_birth_head=True``
+        (default), or to the legacy flat-MLP path otherwise.
+
+        The flat-MLP path ignores ``mask_feats`` and ``action_embed`` for
+        backward compatibility with checkpoints that used the old interface.
+
+        For the four-layer path, ``mask_feats`` should be ``(B, HW, 4)``
+        containing [valid, boundary, reveal, transport_conf] per token.
+        ``action_embed`` should be ``(B, action_dim)``.  Both default to zeros
+        when not provided so the API remains callable from legacy code.
+        """
         if not self.use_completion_head:
             return preds
         if warped_context_raw is None:
             warped_context_raw = torch.zeros_like(preds)
         else:
             warped_context_raw = warped_context_raw.to(device=preds.device, dtype=preds.dtype)
-        inp = torch.cat([preds, warped_context_raw], dim=-1)
-        return preds + torch.tanh(self.completion_gate) * self.completion_refine(inp)
+        if self.use_four_layer_birth_head:
+            B, HW = preds.shape[:2]
+            if mask_feats is None:
+                mask_feats = preds.new_zeros(B, HW, 4)
+            else:
+                mask_feats = mask_feats.to(device=preds.device, dtype=preds.dtype)
+            if action_embed is None:
+                _act_dim = self.completion_refine.cross_layer_cond[0].in_features \
+                    - self.completion_refine.n_layers * self.completion_refine.layer_dim \
+                    - 4  # n_mask_feats
+                action_embed = preds.new_zeros(B, _act_dim)
+            else:
+                action_embed = action_embed.to(device=preds.device, dtype=preds.dtype)
+            delta = self.completion_refine(preds, warped_context_raw, mask_feats, action_embed)
+            return preds + torch.tanh(self.completion_gate) * delta
+        else:
+            inp = torch.cat([preds, warped_context_raw], dim=-1)
+            return preds + torch.tanh(self.completion_gate) * self.completion_refine(inp)
 
     # ---------------------------------------------------------------------- #
     # Initialisation helpers
@@ -836,13 +1095,17 @@ class CameraConditionedPredictorAC(nn.Module):
             # grid_sample expects coords in [-1, 1] with (x, y) order.
             src_xy_gs = (src_xy * 2.0 - 1.0).reshape(B, gh, gw, 2)
             ctx_nchw = x_frames[:, c].reshape(B, gh, gw, D).permute(0, 3, 1, 2).contiguous()
+            # When padding_mode='learned', pass 'zeros' to F.grid_sample so OOV
+            # positions are zero-filled, then substitute the learned unseen token.
+            _pm = "zeros" if self.warp_context_padding_mode == "learned" else self.warp_context_padding_mode
             warped_nchw = F.grid_sample(
                 ctx_nchw,
                 src_xy_gs,
                 mode="bilinear",
-                padding_mode=self.warp_context_padding_mode,
+                padding_mode=_pm,
                 align_corners=False,
             )
+            warped_nchw = self._apply_learned_oov(warped_nchw, src_xy_gs)
             warped_proj = warped_nchw.permute(0, 2, 3, 1).reshape(B, HW, D)
 
             if (
@@ -859,9 +1122,10 @@ class CameraConditionedPredictorAC(nn.Module):
                     ctx_nchw,
                     src_xy_rot_gs,
                     mode="bilinear",
-                    padding_mode=self.warp_context_padding_mode,
+                    padding_mode=_pm,
                     align_corners=False,
                 )
+                warped_rot_nchw = self._apply_learned_oov(warped_rot_nchw, src_xy_rot_gs)
                 warped_rot = warped_rot_nchw.permute(0, 2, 3, 1).reshape(B, HW, D)
                 gate = depth_gate.to(dtype=dtype).reshape(B, HW, 1)
                 warped[c] = gate * warped_proj + (1.0 - gate) * warped_rot
@@ -898,11 +1162,16 @@ class CameraConditionedPredictorAC(nn.Module):
             return None
 
         dtype = x_raw.dtype
-        src_state = states[:, -1].to(dtype=dtype)            # (B, 7)
-        src_action = actions[:, -1].to(dtype=dtype)          # (B, 7)
+        # ``states`` window = [ctx_0, ..., ctx_{T-2}, target].
+        # Slot -2 is the last *context* frame; slot -1 is the target.
+        # ``actions`` window has the same shape; slot -2 is the transition
+        # from the last context frame into the target, and slot -1 is the
+        # zero-padded outgoing action (no next frame to move to).
+        src_state = states[:, -2].to(dtype=dtype)            # (B, 7) last context frame
+        src_action = actions[:, -2].to(dtype=dtype)          # (B, 7) last-ctx → target
         tgt_state = self._compose_state_action(src_state, src_action)  # (B, 7)
-        src_intr = intrinsics[:, -1].to(dtype=dtype)         # (B, 4)
-        tgt_intr = intrinsics[:, -1].to(dtype=dtype)         # same camera
+        src_intr = intrinsics[:, -2].to(dtype=dtype)         # (B, 4)
+        tgt_intr = intrinsics[:, -1].to(dtype=dtype)         # (B, 4) target frame K
 
         R_src = self._quat_xyzw_to_rotmat(src_state[..., 3:7])   # (B, 3, 3)
         R_tgt = self._quat_xyzw_to_rotmat(tgt_state[..., 3:7])   # (B, 3, 3)
@@ -936,16 +1205,154 @@ class CameraConditionedPredictorAC(nn.Module):
         src_xy = src_h[..., :2] / src_h[..., 2:3].clamp_min(1.0e-6)
         src_xy_gs = (src_xy * 2.0 - 1.0).reshape(B, gh, gw, 2)
 
-        src_features = x_raw[:, -HW:, :]
+        src_features = x_raw[:, (T - 2) * HW:(T - 1) * HW, :]  # last context frame's raw features
         src_nchw = src_features.reshape(B, gh, gw, D).permute(0, 3, 1, 2).contiguous()
+        _pm = "zeros" if self.warp_context_padding_mode == "learned" else self.warp_context_padding_mode
         warped_nchw = F.grid_sample(
             src_nchw,
             src_xy_gs,
             mode="bilinear",
-            padding_mode=self.warp_context_padding_mode,
+            padding_mode=_pm,
             align_corners=False,
         )
+        warped_nchw = self._apply_learned_oov(warped_nchw, src_xy_gs)
         return warped_nchw.permute(0, 2, 3, 1).reshape(B, HW, D)
+
+    def build_target_canvas_inputs(
+        self,
+        context_tokens_raw: torch.Tensor,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        intrinsics: torch.Tensor,
+    ) -> dict:
+        B, _, D = context_tokens_raw.shape
+        HW = self.grid_height * self.grid_width
+        mask_tok = self.future_mask_token.to(
+            device=context_tokens_raw.device,
+            dtype=context_tokens_raw.dtype,
+        ).expand(B, HW, -1)
+        x_full = torch.cat([context_tokens_raw, mask_tok], dim=1)
+        target_depth = None
+        depth_gate = None
+        if (
+            self.warp_mode == "projective_probe"
+            and self._depth_probe is not None
+            and states is not None
+            and intrinsics is not None
+            and x_full.size(1) // HW > 1
+        ):
+            T_in = x_full.size(1) // HW
+            x_target_raw = x_full[:, (T_in - 2) * HW:(T_in - 1) * HW, :]
+            with torch.no_grad():
+                if self._depth_probe_arch == "multiscale":
+                    out = self._depth_probe(
+                        x_target_raw,
+                        grid_h=self.grid_height,
+                        grid_w=self.grid_width,
+                    )
+                    if isinstance(out, dict):
+                        log_depth = out["log_depth"]
+                        log_sigma = out["log_sigma"]
+                        sigma = torch.nn.functional.softplus(log_sigma) + 1.0e-3
+                        depth_gate = torch.exp(-sigma)
+                        if "visibility_logit" in out:
+                            depth_gate = depth_gate * torch.sigmoid(out["visibility_logit"])
+                    else:
+                        log_depth = out
+                else:
+                    log_depth = self._depth_probe(x_target_raw).squeeze(-1)
+                target_depth = (log_depth.exp() * self._depth_probe_alpha).clamp_min(1.0e-3)
+        self._last_target_depth = target_depth.detach() if target_depth is not None else None
+        warped = self._warp_last_context_to_target(
+            x_full,
+            states,
+            actions,
+            intrinsics,
+            target_depth=target_depth,
+        )
+        if warped is None:
+            warped = mask_tok
+            oov = torch.ones(B, HW, 1, device=context_tokens_raw.device, dtype=context_tokens_raw.dtype)
+        else:
+            oov_raw = self._last_warp_oov_mask
+            if oov_raw is None:
+                oov = torch.zeros(B, HW, 1, device=context_tokens_raw.device, dtype=context_tokens_raw.dtype)
+            else:
+                oov = oov_raw.reshape(B, HW, 1).to(device=context_tokens_raw.device, dtype=context_tokens_raw.dtype)
+        valid = 1.0 - oov
+        confidence = valid
+        return {
+            "warped_context_raw": warped,
+            "valid_mask": valid,
+            "oov_mask": oov,
+            "confidence_mask": confidence,
+            "target_depth": target_depth,
+        }
+
+    def prepare_canvas_slot(
+        self,
+        warped_context_raw: torch.Tensor,
+        valid_mask: torch.Tensor,
+        oov_mask: torch.Tensor,
+        boundary_mask: torch.Tensor = None,
+        confidence_mask: torch.Tensor = None,
+        rollout_step: int = 0,
+    ) -> torch.Tensor:
+        B, HW, D = warped_context_raw.shape
+        mask_tok = self.future_mask_token.to(
+            device=warped_context_raw.device,
+            dtype=warped_context_raw.dtype,
+        ).expand(B, HW, -1)
+        if boundary_mask is None:
+            boundary_mask = warped_context_raw.new_zeros(B, HW, 1)
+        else:
+            boundary_mask = boundary_mask.to(device=warped_context_raw.device, dtype=warped_context_raw.dtype).reshape(B, HW, 1)
+        valid_mask = valid_mask.to(device=warped_context_raw.device, dtype=warped_context_raw.dtype).reshape(B, HW, 1)
+        oov_mask = oov_mask.to(device=warped_context_raw.device, dtype=warped_context_raw.dtype).reshape(B, HW, 1)
+        if confidence_mask is None:
+            confidence_mask = valid_mask
+        else:
+            confidence_mask = confidence_mask.to(device=warped_context_raw.device, dtype=warped_context_raw.dtype).reshape(B, HW, 1)
+        type_ids = torch.zeros(B, HW, device=warped_context_raw.device, dtype=torch.long)
+        type_ids = torch.where(boundary_mask.squeeze(-1) > 0.0, torch.ones_like(type_ids), type_ids)
+        type_ids = torch.where(oov_mask.squeeze(-1) > 0.0, torch.full_like(type_ids, 2), type_ids)
+        beta_values = self.canvas_beta_by_type.clamp(0.0, 1.0).to(
+            device=warped_context_raw.device,
+            dtype=warped_context_raw.dtype,
+        )
+        beta = beta_values[type_ids].unsqueeze(-1)
+        target_canvas = beta * warped_context_raw + (1.0 - beta) * mask_tok
+        mask_embed = warped_context_raw.new_zeros(B, HW, D)
+        type_embed = warped_context_raw.new_zeros(B, HW, D)
+        step_embed = warped_context_raw.new_zeros(B, HW, D)
+        if self.canvas_use_mask_feat_embed:
+            mask_feats = torch.cat([valid_mask, oov_mask, boundary_mask, confidence_mask], dim=-1)
+            mask_embed = self.canvas_mask_proj(mask_feats)
+            target_canvas = target_canvas + mask_embed
+        if self.canvas_use_token_type_embed:
+            type_embed = self.canvas_type_embed(type_ids)
+            target_canvas = target_canvas + type_embed
+        if self.canvas_use_target_step_embed:
+            step_id = int(max(0, min(int(rollout_step), self.canvas_target_step_embed.num_embeddings - 1)))
+            step_ids = torch.full((B, HW), step_id, device=warped_context_raw.device, dtype=torch.long)
+            step_embed = self.canvas_target_step_embed(step_ids)
+            target_canvas = target_canvas + step_embed
+        with torch.no_grad():
+            mask_norm = mask_tok.norm(dim=-1).mean().clamp_min(1.0e-6)
+            self._last_canvas_diag = {
+                "valid_frac": float(valid_mask.mean().detach().item()),
+                "oov_frac": float(oov_mask.mean().detach().item()),
+                "boundary_frac": float(boundary_mask.mean().detach().item()),
+                "beta_valid": float(beta_values[0].detach().item()),
+                "beta_boundary": float(beta_values[1].detach().item()),
+                "beta_oov": float(beta_values[2].detach().item()),
+                "input_norm_ratio": float((warped_context_raw.norm(dim=-1).mean() / mask_norm).detach().item()),
+                "warp_norm": float(warped_context_raw.norm(dim=-1).mean().detach().item()),
+                "mask_token_norm": float(mask_norm.detach().item()),
+                "mask_embed_norm": float(mask_embed.norm(dim=-1).mean().detach().item()),
+                "type_embed_norm": float(type_embed.norm(dim=-1).mean().detach().item()),
+            }
+        return target_canvas
 
     @staticmethod
     def _compose_state_action(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
@@ -1263,7 +1670,15 @@ class CameraConditionedPredictorAC(nn.Module):
             HW_full = self.grid_height * self.grid_width
             T_in = x.size(1) // HW_full
             if T_in > 1:
-                x_target_raw = x[:, -HW_full:, :]                       # (B, HW, input_token_dim)
+                # Probe the *last context frame's* raw encoder features (the
+                # second-to-last slot) to estimate source-frame depth.  The
+                # final slot ``x[:, -HW_full:]`` is the future_mask_token — a
+                # learned constant that carries zero scene information, so
+                # running the depth probe there produces scene-invariant
+                # (position-only) depth and makes the projective warp useless.
+                # Using the last *real* context features gives the probe access
+                # to the actual scene geometry adjacent to the target frame.
+                x_target_raw = x[:, (T_in - 2) * HW_full:(T_in - 1) * HW_full, :]  # (B, HW, input_token_dim)
                 with torch.no_grad():
                     if self._depth_probe_arch == "multiscale":
                         out = self._depth_probe(
@@ -1324,6 +1739,12 @@ class CameraConditionedPredictorAC(nn.Module):
                 target_depth=target_depth,
                 depth_gate=depth_gate,
             )
+
+        # P0.6: expose target_depth for diagnostic logging in train.py without
+        # changing the return signature.  Reset to None at the start of each
+        # forward to prevent stale values / retained graph references.
+        self._last_target_depth = None
+        self._last_target_depth = target_depth.detach() if target_depth is not None else None
 
         # Compute warped last-context-frame features in raw encoder space
         # for residual_target loss mode (Run B).

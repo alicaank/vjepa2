@@ -140,6 +140,15 @@ model:
   use_residual_head: true
   residual_head_depth: 2
   residual_head_ratio: 2.0
+  warp_context_padding_mode: zeros
+  target_slot_mode: mask
+  canvas_beta_init_valid: 0.0
+  canvas_beta_init_boundary: 0.0
+  canvas_beta_init_oov: 0.0
+  canvas_use_mask_feat_embed: true
+  canvas_use_token_type_embed: true
+  canvas_use_target_step_embed: true
+  use_posthoc_completion_blend: true
   # Phase C — inference-time latent corrector (TCR design §5).
   # Disabled by default. Enable with model.corrector.enabled: true; pick
   # mode=frozen_predictor for the C1 ablation (cleanest isolation), or
