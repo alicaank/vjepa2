@@ -570,6 +570,9 @@ def main(args, resume_preempt=False):
     checkpoint_save_mode = str(
         cfgs_meta.get("checkpoint_save_mode", os.environ.get("CHECKPOINT_SAVE_MODE", "auto"))
     ).lower()
+    checkpoint_saving_enabled = checkpoint_save_mode not in {"none", "off", "disabled", "false", "0"}
+    save_final_checkpoint = bool(cfgs_meta.get("save_final_checkpoint", True))
+    checkpoint_eval_enabled = bool(cfgs_meta.get("checkpoint_eval_enabled", True))
     skip_batches = cfgs_meta.get("skip_batches", -1)
     use_sdpa = cfgs_meta.get("use_sdpa", True)
     sync_gc = cfgs_meta.get("sync_gc", False)
@@ -643,11 +646,12 @@ def main(args, resume_preempt=False):
     # ablation: default off, gated by cfgs_model and/or env var.
     warp_context_latents = bool(cfgs_model.get("warp_context_latents", False))
     warp_context_padding_mode = str(cfgs_model.get("warp_context_padding_mode", "zeros"))
-    # Path B-lite Step 1 — depth-aware projective warp via a frozen probe.
+    # Path B-lite Step 1 — depth-aware projective warp.
     # ``warp_mode`` selects the transport: "auto" maps to legacy behaviour
     # (rotation_only iff warp_context_latents=True else off); "rotation_only"
     # forces the legacy infinity-plane homography; "projective_probe" uses
-    # the depth-probe target depth and requires ``depth_probe_checkpoint``.
+    # the depth-probe target depth and requires ``depth_probe_checkpoint``;
+    # "projective_da3" uses online DA3 target depth supplied by the trainer.
     warp_mode = str(cfgs_model.get("warp_mode", "auto"))
     depth_probe_checkpoint = cfgs_model.get("depth_probe_checkpoint", None)
     if depth_probe_checkpoint is not None:
@@ -659,6 +663,17 @@ def main(args, resume_preempt=False):
     canvas_use_mask_feat_embed = bool(cfgs_model.get("canvas_use_mask_feat_embed", True))
     canvas_use_token_type_embed = bool(cfgs_model.get("canvas_use_token_type_embed", True))
     canvas_use_target_step_embed = bool(cfgs_model.get("canvas_use_target_step_embed", True))
+    canvas_warp_mode = str(cfgs_model.get("canvas_warp_mode", "raw"))
+    canvas_projector_gamma_init = float(cfgs_model.get("canvas_projector_gamma_init", 0.0))
+    canvas_norm_clip_ratio = float(cfgs_model.get("canvas_norm_clip_ratio", 1.0))
+    canvas_block_mask_enabled = bool(cfgs_model.get("canvas_block_mask_enabled", False))
+    canvas_block_mask_min_rects = int(cfgs_model.get("canvas_block_mask_min_rects", 1))
+    canvas_block_mask_max_rects = int(cfgs_model.get("canvas_block_mask_max_rects", 3))
+    canvas_block_mask_min_frac = float(cfgs_model.get("canvas_block_mask_min_frac", 0.2))
+    canvas_block_mask_max_frac = float(cfgs_model.get("canvas_block_mask_max_frac", 0.3))
+    camera_ucpe_enabled = bool(cfgs_model.get("camera_ucpe_enabled", False))
+    camera_ucpe_apply_layers = tuple(int(i) for i in cfgs_model.get("camera_ucpe_apply_layers", [0, 3, 6, 9]))
+    camera_ucpe_gamma_init = float(cfgs_model.get("camera_ucpe_gamma_init", 0.0))
     use_posthoc_completion_blend = bool(cfgs_model.get("use_posthoc_completion_blend", True))
 
     # ------------------------------------------------------------------ #
@@ -852,14 +867,15 @@ def main(args, resume_preempt=False):
         cfgs_completion.get("da3_model_id", "depth-anything/DA3-GIANT-1.1")
     )
     completion_da3_depth_res = int(cfgs_completion.get("da3_depth_res", crop_size))
+    da3_warp_enabled = warp_mode == "projective_da3"
     if completion_enabled and not use_completion_head:
         logger.warning(
             "loss.completion.enabled=True but model.use_completion_head=False; "
             "enabling the masked region metrics but skipping completion-head loss."
         )
-    if completion_enabled and completion_mask_source == "da3" and not _DEPTH_TEACHER_AVAILABLE:
+    if ((completion_enabled and completion_mask_source == "da3") or da3_warp_enabled) and not _DEPTH_TEACHER_AVAILABLE:
         raise ImportError(
-            "loss.completion.mask_source='da3' requires src.training.common.depth_teacher."
+            "DA3 depth usage requires src.training.common.depth_teacher."
         )
     # 1.4: when enabled, completion is blended into the *real* prediction path
     # rather than being a side-branch auxiliary loss only.
@@ -1229,6 +1245,17 @@ def main(args, resume_preempt=False):
         canvas_use_mask_feat_embed=canvas_use_mask_feat_embed,
         canvas_use_token_type_embed=canvas_use_token_type_embed,
         canvas_use_target_step_embed=canvas_use_target_step_embed,
+        canvas_warp_mode=canvas_warp_mode,
+        canvas_projector_gamma_init=canvas_projector_gamma_init,
+        canvas_norm_clip_ratio=canvas_norm_clip_ratio,
+        canvas_block_mask_enabled=canvas_block_mask_enabled,
+        canvas_block_mask_min_rects=canvas_block_mask_min_rects,
+        canvas_block_mask_max_rects=canvas_block_mask_max_rects,
+        canvas_block_mask_min_frac=canvas_block_mask_min_frac,
+        canvas_block_mask_max_frac=canvas_block_mask_max_frac,
+        camera_ucpe_enabled=camera_ucpe_enabled,
+        camera_ucpe_apply_layers=camera_ucpe_apply_layers,
+        camera_ucpe_gamma_init=camera_ucpe_gamma_init,
         correspondence_bias_enabled=correspondence_bias_enabled,
         correspondence_bias_mode=correspondence_bias_mode,
         correspondence_bias_sigma_tokens=correspondence_bias_sigma_tokens,
@@ -1311,17 +1338,19 @@ def main(args, resume_preempt=False):
             completion_depth_tau,
             completion_boundary_dilate,
         )
-    if completion_enabled and completion_mask_source == "da3":
+    if (completion_enabled and completion_mask_source == "da3") or da3_warp_enabled:
         if load_depth_teacher is None:
-            raise RuntimeError("DA3 completion masks requested but depth teacher loader is unavailable.")
+            raise RuntimeError("DA3 depth requested but depth teacher loader is unavailable.")
         completion_depth_processor, completion_depth_teacher = load_depth_teacher(
             device=device,
             model_id=completion_da3_model_id,
         )
         logger.info(
-            "Completion route DA3 masks: model=%s depth_res=%d",
+            "DA3 depth teacher: model=%s depth_res=%d completion_masks=%s warp=%s",
             completion_da3_model_id,
             completion_da3_depth_res,
+            completion_enabled and completion_mask_source == "da3",
+            da3_warp_enabled,
         )
 
     if compile_model:
@@ -1490,6 +1519,7 @@ def main(args, resume_preempt=False):
             logger.info("Running single-process training without DistributedDataParallel.")
     for p in target_encoder.parameters():
         p.requires_grad = False
+    predictor_ref = predictor.module if hasattr(predictor, "module") else predictor
 
     # Paper-faithful V-JEPA 2-AC: when the context-encoder LR scale is 0 we
     # also disable its gradients so the backward pass actually skips the
@@ -1778,6 +1808,8 @@ def main(args, resume_preempt=False):
             logger.warning(f"destroy_process_group failed: {e}")
 
     def save_checkpoint(epoch, path):
+        if not checkpoint_saving_enabled:
+            return False
         if rank != 0:
             return False
         _purge_runtime_caches()
@@ -2084,6 +2116,19 @@ def main(args, resume_preempt=False):
             ctx_lo = _enc(ctx_clip)
             h_ctx = torch.cat(ctx_lo, dim=-1)
             B_v = h_ctx.shape[0]
+            target_depth_eval = None
+            if da3_warp_enabled:
+                if completion_depth_teacher is None or compute_teacher_depths_batch_with_confidence is None:
+                    raise RuntimeError("DA3 warp requested but depth teacher is not initialized.")
+                depth_maps_warp_eval, _ = compute_teacher_depths_batch_with_confidence(
+                    v_imgs[:, target_idx * tubelet_size].float(),
+                    depth_processor=completion_depth_processor,
+                    depth_model=completion_depth_teacher,
+                    device=device,
+                    H=v_imgs.shape[-2],
+                    W=v_imgs.shape[-1],
+                )
+                target_depth_eval = depth_maps_warp_eval
             if target_slot_mode == "canvas_first" and hasattr(_pred, "build_target_canvas_inputs"):
                 local_states_eval_canvas = _canonicalize_states(v_states[:, :target_idx + 1])
                 local_actions_eval_canvas = v_actions[:, :target_idx + 1]
@@ -2095,6 +2140,7 @@ def main(args, resume_preempt=False):
                     local_states_eval_canvas,
                     local_actions_eval_canvas,
                     local_intr_eval_canvas,
+                    target_depth=target_depth_eval,
                 )
                 boundary_v = _rotation_unseen_boundary_mask(
                     _pred,
@@ -2126,6 +2172,7 @@ def main(args, resume_preempt=False):
                     if target_slot_mode == "canvas_first"
                     else (v_intrinsics[:, :target_idx + 1] if use_intrinsics else None)
                 ),
+                target_depth=target_depth_eval,
             )
             region_masks = None
             if completion_enabled:
@@ -2535,6 +2582,7 @@ def main(args, resume_preempt=False):
         canvas_mask_token_norm_meter = AverageMeter()
         canvas_mask_embed_norm_meter = AverageMeter()
         canvas_type_embed_norm_meter = AverageMeter()
+        canvas_block_mask_frac_meter = AverageMeter()
         layer_loss_meters = [AverageMeter() for _ in range(4)]
         # Phase R diagnostics (TCR design section 3.6). Cycle loss is the
         # primary reversibility signal; drift_from_prev is the identity-
@@ -2699,9 +2747,10 @@ def main(args, resume_preempt=False):
                 ]
                 predictor_ref = predictor.module if hasattr(predictor, "module") else predictor
                 completion_depths = None
-                if completion_enabled and completion_mask_source == "da3":
+                da3_depths = None
+                if (completion_enabled and completion_mask_source == "da3") or da3_warp_enabled:
                     if completion_depth_teacher is None or compute_teacher_depths_batch_with_confidence is None:
-                        raise RuntimeError("DA3 completion masks requested but depth teacher is not initialized.")
+                        raise RuntimeError("DA3 depth requested but depth teacher is not initialized.")
                     with torch.no_grad():
                         depth_imgs = imgs[:, ::tubelet_size].reshape(
                             B * total_tubelets, C, H, W
@@ -2725,7 +2774,9 @@ def main(args, resume_preempt=False):
                             H=H,
                             W=W,
                         )
-                        completion_depths = depth_maps.reshape(B, total_tubelets, H, W)
+                        da3_depths = depth_maps.reshape(B, total_tubelets, H, W)
+                        if completion_enabled and completion_mask_source == "da3":
+                            completion_depths = da3_depths
 
                 def forward_predictor_with_trajectory(
                     step_context_latents,
@@ -2733,6 +2784,7 @@ def main(args, resume_preempt=False):
                     local_actions_window,
                     local_intrinsics_window,
                     rollout_step=0,
+                    target_depth=None,
                 ):
                     """Predictor forward pass with explicit, pre-canonicalized
                     trajectory tensors.
@@ -2763,6 +2815,7 @@ def main(args, resume_preempt=False):
                             local_states_canon,
                             local_actions_window,
                             local_intrinsics_window,
+                            target_depth=target_depth,
                         )
                         boundary_canvas = _rotation_unseen_boundary_mask(
                             predictor_ref,
@@ -2792,6 +2845,7 @@ def main(args, resume_preempt=False):
                         local_actions_window,
                         local_states_canon,
                         intrinsics=local_intrinsics_window,
+                        target_depth=target_depth,
                     )
                     fsq_slice = fsq_logits[:, -HW:, :, :] if fsq_logits is not None else None
                     if delta_preds is not None:
@@ -2822,6 +2876,11 @@ def main(args, resume_preempt=False):
                         local_actions,
                         local_intrinsics,
                         rollout_step=max(0, target_tubelet_idx - len(step_context_latents)),
+                        target_depth=(
+                            da3_depths[:, target_tubelet_idx]
+                            if da3_warp_enabled and da3_depths is not None
+                            else None
+                        ),
                     )
 
                 def loss_fn(
@@ -2958,6 +3017,11 @@ def main(args, resume_preempt=False):
                             local_actions_step,
                             local_intrinsics_step,
                             rollout_step=rollout_step,
+                            target_depth=(
+                                da3_depths[:, target_tubelet_idx]
+                                if da3_warp_enabled and da3_depths is not None
+                                else None
+                            ),
                         )
                         if target_slot_mode == "canvas_first":
                             _canvas_diag = getattr(predictor_ref, "_last_canvas_diag", None)
@@ -2969,10 +3033,11 @@ def main(args, resume_preempt=False):
                                 canvas_beta_boundary_meter.update(float(_canvas_diag["beta_boundary"]))
                                 canvas_beta_oov_meter.update(float(_canvas_diag["beta_oov"]))
                                 canvas_input_norm_ratio_meter.update(float(_canvas_diag["input_norm_ratio"]))
-                                canvas_warp_norm_meter.update(float(_canvas_diag["warp_norm"]))
+                                canvas_warp_norm_meter.update(float(_canvas_diag.get("canvas_warp_norm", _canvas_diag["warp_norm"])))
                                 canvas_mask_token_norm_meter.update(float(_canvas_diag["mask_token_norm"]))
                                 canvas_mask_embed_norm_meter.update(float(_canvas_diag["mask_embed_norm"]))
                                 canvas_type_embed_norm_meter.update(float(_canvas_diag["type_embed_norm"]))
+                                canvas_block_mask_frac_meter.update(float(_canvas_diag.get("block_mask_frac", 0.0)))
                         h_tgt_this = h_target_tubelets[target_tubelet_idx]
                         _incoming_action_idx = max(0, target_tubelet_idx - 1)
                         _incoming_action = actions[:, _incoming_action_idx]
@@ -3415,6 +3480,11 @@ def main(args, resume_preempt=False):
                                     local_states_bwd,
                                     local_actions_bwd,
                                     local_intrinsics_bwd,
+                                    target_depth=(
+                                        da3_depths[:, t_end - 1]
+                                        if da3_warp_enabled and da3_depths is not None
+                                        else None
+                                    ),
                                 )
                                 # Supervise against the GT target latent at
                                 # the previous tubelet.
@@ -3532,6 +3602,11 @@ def main(args, resume_preempt=False):
                                 local_states_co,
                                 local_actions_co,
                                 local_intrinsics_co,
+                                target_depth=(
+                                    da3_depths[:, comp_end]
+                                    if da3_warp_enabled and da3_depths is not None
+                                    else None
+                                ),
                             )
 
                             # Aggregate the supervised anchor + optional
@@ -3579,6 +3654,11 @@ def main(args, resume_preempt=False):
                                     _states_seq_1,
                                     _actions_seq_1,
                                     _intr_seq_1,
+                                    target_depth=(
+                                        da3_depths[:, comp_start + 1]
+                                        if da3_warp_enabled and da3_depths is not None
+                                        else None
+                                    ),
                                 )
                                 # Step 2: comp_start+1 -> comp_end (= +2).
                                 _states_seq_2 = _canonicalize_states(
@@ -3605,6 +3685,11 @@ def main(args, resume_preempt=False):
                                     _states_seq_2,
                                     _actions_seq_2,
                                     _intr_seq_2,
+                                    target_depth=(
+                                        da3_depths[:, comp_end]
+                                        if da3_warp_enabled and da3_depths is not None
+                                        else None
+                                    ),
                                 )
                                 _rhs = (
                                     preds_seq_2step.detach()
@@ -4003,7 +4088,7 @@ def main(args, resume_preempt=False):
                         _diag_log += " [layer_L1: %s]" % _ll_str
                     if target_slot_mode == "canvas_first" and canvas_valid_meter.count > 0:
                         _diag_log += (
-                            " [canvas valid/oov/bnd: %.3f/%.3f/%.3f beta: %.3f/%.3f/%.3f norm_ratio: %.3f warp/mask/mskemb/typeemb: %.3f/%.3f/%.3f/%.3f]"
+                            " [canvas valid/oov/bnd: %.3f/%.3f/%.3f beta: %.3f/%.3f/%.3f norm_ratio: %.3f warp/mask/mskemb/typeemb: %.3f/%.3f/%.3f/%.3f blk: %.3f]"
                             % (
                                 canvas_valid_meter.avg,
                                 canvas_oov_meter.avg,
@@ -4016,7 +4101,26 @@ def main(args, resume_preempt=False):
                                 canvas_mask_token_norm_meter.avg,
                                 canvas_mask_embed_norm_meter.avg,
                                 canvas_type_embed_norm_meter.avg,
+                                canvas_block_mask_frac_meter.avg,
                             )
+                        )
+                    if getattr(predictor_ref, "camera_ucpe_enabled", False):
+                        _ucpe_gammas = [
+                            "L%d:%.4f" % (i, predictor_ref.camera_ucpe_branches[str(i)].gamma.item())
+                            for i in predictor_ref.camera_ucpe_apply_layers
+                        ]
+                        _ucpe_grad_norms = [
+                            "L%d:%.4f" % (
+                                i,
+                                predictor_ref.camera_ucpe_branches[str(i)].gamma.grad.item()
+                                if predictor_ref.camera_ucpe_branches[str(i)].gamma.grad is not None
+                                else float("nan"),
+                            )
+                            for i in predictor_ref.camera_ucpe_apply_layers
+                        ]
+                        _diag_log += " [ucpe_gamma: %s ucpe_gamma_grad: %s]" % (
+                            " ".join(_ucpe_gammas),
+                            " ".join(_ucpe_grad_norms),
                         )
                     logger.info(
                         "[%d, %5d] loss: %.3f [pred: %.3f ctx: %.3f step1: %.3f step2: %.3f]%s%s%s%s%s "
@@ -4094,21 +4198,24 @@ def main(args, resume_preempt=False):
                         last_corrector_layer_stats.get(f"scale_l{_l}", float("nan"))
                     )
 
-        if epoch > 0 and (epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1)):
+        final_epoch = epoch == (num_epochs - 1)
+        periodic_checkpoint_epoch = save_every_freq > 0 and (epoch + 1) % save_every_freq == 0
+        if checkpoint_saving_enabled and epoch > 0 and (periodic_checkpoint_epoch or (final_epoch and save_final_checkpoint)):
             checkpoint_saved = False
             checkpoint_path = None
-            if epoch == (num_epochs - 1):
+            if final_epoch and save_final_checkpoint:
                 checkpoint_path = final_path
                 checkpoint_saved = save_checkpoint(epoch + 1, checkpoint_path)
-            elif save_every_freq > 0 and epoch % save_every_freq == 0:
-                checkpoint_path = os.path.join(scratch_folder, f"e{epoch}.pt")
+            elif periodic_checkpoint_epoch:
+                checkpoint_path = os.path.join(scratch_folder, f"e{epoch + 1}.pt")
                 checkpoint_saved = save_checkpoint(epoch + 1, checkpoint_path)
             checkpoint_saved = _broadcast_bool_from_rank0(checkpoint_saved)
 
             if checkpoint_saved:
                 _prune_checkpoint_outputs(checkpoint_path)
-                run_checkpoint_evaluation(epoch)
-            elif epoch == (num_epochs - 1) or (save_every_freq > 0 and epoch % save_every_freq == 0):
+                if checkpoint_eval_enabled:
+                    run_checkpoint_evaluation(epoch)
+            elif periodic_checkpoint_epoch or (final_epoch and save_final_checkpoint):
                 logger.warning("Keeping previous checkpoint because the new checkpoint save did not succeed.")
                 logger.warning("Skipping checkpoint evaluation because checkpoint save did not succeed.")
             _safe_dist_barrier()

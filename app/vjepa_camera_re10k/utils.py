@@ -268,10 +268,13 @@ def load_checkpoint(
         # random init / encoder at pretrained, producing degenerate rollout
         # evals that look identical across every experiment.
         live_keys = set(model.state_dict().keys())
-        if pretrained_dict and all(k.startswith("module.") for k in pretrained_dict.keys()):
+        if pretrained_dict:
+            ckpt_is_wrapped = all(k.startswith("module.") for k in pretrained_dict.keys())
             live_is_wrapped = any(k.startswith("module.") for k in live_keys)
-            if not live_is_wrapped:
+            if ckpt_is_wrapped and not live_is_wrapped:
                 pretrained_dict = {k[len("module."):]: v for k, v in pretrained_dict.items()}
+            elif live_is_wrapped and not ckpt_is_wrapped:
+                pretrained_dict = {f"module.{k}": v for k, v in pretrained_dict.items()}
         if key in ("encoder", "target_encoder"):
             pretrained_dict = _upgrade_camera_encoder_state_dict(pretrained_dict, model)
         if key == "predictor":
@@ -305,6 +308,7 @@ def load_checkpoint(
                 "canvas_mask_proj.",
                 "canvas_type_embed.",
                 "canvas_target_step_embed.",
+                "camera_ucpe_branches.",
             )
             leaked = [k for k in unexpected if any(k.startswith(p) for p in flag_prefixes)]
             if leaked:
@@ -313,7 +317,7 @@ def load_checkpoint(
                     "are not present in the live model: "
                     f"{leaked}. The predictor was built without the matching "
                     "USE_RAY_PE / USE_DELTA_HEAD / USE_RESIDUAL_HEAD / "
-                    "TARGET_SLOT_MODE flags. "
+                    "TARGET_SLOT_MODE / CAMERA_UCPE_ENABLED flags. "
                     "Set the corresponding environment variable (or kwarg) so "
                     "init_video_model instantiates the right modules before "
                     "loading this checkpoint."
@@ -322,7 +326,10 @@ def load_checkpoint(
     if opt is not None:
         opt_state = checkpoint.get("opt")
         if opt_state is not None:
-            opt.load_state_dict(opt_state)
+            try:
+                opt.load_state_dict(opt_state)
+            except ValueError as e:
+                logger.warning(f"Skipping optimizer state load because it is incompatible with the live model: {e}")
         else:
             logger.warning("Checkpoint has no optimizer state; resuming from weights-only checkpoint.")
     if scaler is not None:
@@ -440,12 +447,23 @@ def init_video_model(
     canvas_use_mask_feat_embed=True,
     canvas_use_token_type_embed=True,
     canvas_use_target_step_embed=True,
+    canvas_warp_mode="raw",
+    canvas_projector_gamma_init=0.0,
+    canvas_norm_clip_ratio=1.0,
+    canvas_block_mask_enabled=False,
+    canvas_block_mask_min_rects=1,
+    canvas_block_mask_max_rects=3,
+    canvas_block_mask_min_frac=0.2,
+    canvas_block_mask_max_frac=0.3,
     correspondence_bias_enabled=False,
     correspondence_bias_mode="rotation_homography",
     correspondence_bias_sigma_tokens=2.0,
     correspondence_bias_lambda_init=0.0,
     correspondence_bias_learnable=True,
     correspondence_bias_apply_layers=(0, 1, 2, 3, 4, 5),
+    camera_ucpe_enabled=False,
+    camera_ucpe_apply_layers=(0, 3, 6, 9),
+    camera_ucpe_gamma_init=0.0,
     encoder_backbone="vjepa21",
     encoder_freeze=False,
 ):
@@ -533,6 +551,14 @@ def init_video_model(
     canvas_use_mask_feat_embed = _env_bool("CANVAS_USE_MASK_FEAT_EMBED", canvas_use_mask_feat_embed)
     canvas_use_token_type_embed = _env_bool("CANVAS_USE_TOKEN_TYPE_EMBED", canvas_use_token_type_embed)
     canvas_use_target_step_embed = _env_bool("CANVAS_USE_TARGET_STEP_EMBED", canvas_use_target_step_embed)
+    canvas_warp_mode = os.environ.get("CANVAS_WARP_MODE", canvas_warp_mode) or "raw"
+    canvas_projector_gamma_init = _env_float("CANVAS_PROJECTOR_GAMMA_INIT", canvas_projector_gamma_init)
+    canvas_norm_clip_ratio = _env_float("CANVAS_NORM_CLIP_RATIO", canvas_norm_clip_ratio)
+    canvas_block_mask_enabled = bool(canvas_block_mask_enabled) or _env_bool("CANVAS_BLOCK_MASK_ENABLED", False)
+    canvas_block_mask_min_rects = _env_int("CANVAS_BLOCK_MASK_MIN_RECTS", canvas_block_mask_min_rects)
+    canvas_block_mask_max_rects = _env_int("CANVAS_BLOCK_MASK_MAX_RECTS", canvas_block_mask_max_rects)
+    canvas_block_mask_min_frac = _env_float("CANVAS_BLOCK_MASK_MIN_FRAC", canvas_block_mask_min_frac)
+    canvas_block_mask_max_frac = _env_float("CANVAS_BLOCK_MASK_MAX_FRAC", canvas_block_mask_max_frac)
     # Phase E1 correspondence-bias env-var fallback. Mirrors the warp pattern.
     correspondence_bias_enabled = bool(correspondence_bias_enabled) or _env_bool("CORR_BIAS_ENABLED", False)
     correspondence_bias_mode = os.environ.get("CORR_BIAS_MODE", correspondence_bias_mode)
@@ -543,6 +569,11 @@ def init_video_model(
     apply_layers_env = _env_int_list("CORR_BIAS_APPLY_LAYERS")
     if apply_layers_env is not None:
         correspondence_bias_apply_layers = tuple(apply_layers_env)
+    camera_ucpe_enabled = bool(camera_ucpe_enabled) or _env_bool("CAMERA_UCPE_ENABLED", False)
+    camera_ucpe_gamma_init = _env_float("CAMERA_UCPE_GAMMA_INIT", camera_ucpe_gamma_init)
+    camera_ucpe_layers_env = _env_int_list("CAMERA_UCPE_APPLY_LAYERS")
+    if camera_ucpe_layers_env is not None:
+        camera_ucpe_apply_layers = tuple(camera_ucpe_layers_env)
     logger.info(
         "init_video_model experiment flags: "
         f"encoder_backbone={encoder_backbone} (freeze={encoder_freeze}) "
@@ -555,11 +586,16 @@ def init_video_model(
         f"four_layer_birth={use_four_layer_birth_head}, hidden={completion_head_hidden}) "
         f"warp_context_latents={warp_context_latents} (padding={warp_context_padding_mode}) "
         f"warp_mode={warp_mode} depth_probe_checkpoint={depth_probe_checkpoint} "
-        f"target_slot_mode={target_slot_mode} "
+        f"target_slot_mode={target_slot_mode} canvas_warp_mode={canvas_warp_mode} "
+        f"canvas_block_mask_enabled={canvas_block_mask_enabled} "
+        f"(rects={canvas_block_mask_min_rects}-{canvas_block_mask_max_rects}, "
+        f"frac={canvas_block_mask_min_frac}-{canvas_block_mask_max_frac}) "
         f"correspondence_bias_enabled={correspondence_bias_enabled} "
         f"(mode={correspondence_bias_mode}, sigma={correspondence_bias_sigma_tokens}, "
         f"lambda_init={correspondence_bias_lambda_init}, learnable={correspondence_bias_learnable}, "
-        f"apply_layers={tuple(correspondence_bias_apply_layers)})"
+        f"apply_layers={tuple(correspondence_bias_apply_layers)}) "
+        f"camera_ucpe_enabled={camera_ucpe_enabled} "
+        f"(apply_layers={tuple(camera_ucpe_apply_layers)}, gamma_init={camera_ucpe_gamma_init})"
     )
 
     # ------------------------------------------------------------------
@@ -649,12 +685,23 @@ def init_video_model(
             canvas_use_mask_feat_embed=canvas_use_mask_feat_embed,
             canvas_use_token_type_embed=canvas_use_token_type_embed,
             canvas_use_target_step_embed=canvas_use_target_step_embed,
+            canvas_warp_mode=canvas_warp_mode,
+            canvas_projector_gamma_init=canvas_projector_gamma_init,
+            canvas_norm_clip_ratio=canvas_norm_clip_ratio,
+            canvas_block_mask_enabled=canvas_block_mask_enabled,
+            canvas_block_mask_min_rects=canvas_block_mask_min_rects,
+            canvas_block_mask_max_rects=canvas_block_mask_max_rects,
+            canvas_block_mask_min_frac=canvas_block_mask_min_frac,
+            canvas_block_mask_max_frac=canvas_block_mask_max_frac,
             correspondence_bias_enabled=correspondence_bias_enabled,
             correspondence_bias_mode=correspondence_bias_mode,
             correspondence_bias_sigma_tokens=correspondence_bias_sigma_tokens,
             correspondence_bias_lambda_init=correspondence_bias_lambda_init,
             correspondence_bias_learnable=correspondence_bias_learnable,
             correspondence_bias_apply_layers=tuple(correspondence_bias_apply_layers),
+            camera_ucpe_enabled=camera_ucpe_enabled,
+            camera_ucpe_apply_layers=tuple(camera_ucpe_apply_layers),
+            camera_ucpe_gamma_init=camera_ucpe_gamma_init,
         )
 
         encoder.to(device)
@@ -796,12 +843,23 @@ def init_video_model(
         canvas_use_mask_feat_embed=canvas_use_mask_feat_embed,
         canvas_use_token_type_embed=canvas_use_token_type_embed,
         canvas_use_target_step_embed=canvas_use_target_step_embed,
+        canvas_warp_mode=canvas_warp_mode,
+        canvas_projector_gamma_init=canvas_projector_gamma_init,
+        canvas_norm_clip_ratio=canvas_norm_clip_ratio,
+        canvas_block_mask_enabled=canvas_block_mask_enabled,
+        canvas_block_mask_min_rects=canvas_block_mask_min_rects,
+        canvas_block_mask_max_rects=canvas_block_mask_max_rects,
+        canvas_block_mask_min_frac=canvas_block_mask_min_frac,
+        canvas_block_mask_max_frac=canvas_block_mask_max_frac,
         correspondence_bias_enabled=correspondence_bias_enabled,
         correspondence_bias_mode=correspondence_bias_mode,
         correspondence_bias_sigma_tokens=correspondence_bias_sigma_tokens,
         correspondence_bias_lambda_init=correspondence_bias_lambda_init,
         correspondence_bias_learnable=correspondence_bias_learnable,
         correspondence_bias_apply_layers=tuple(correspondence_bias_apply_layers),
+        camera_ucpe_enabled=camera_ucpe_enabled,
+        camera_ucpe_apply_layers=tuple(camera_ucpe_apply_layers),
+        camera_ucpe_gamma_init=camera_ucpe_gamma_init,
     )
 
     encoder.to(device)

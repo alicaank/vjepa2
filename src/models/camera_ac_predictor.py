@@ -149,6 +149,44 @@ class FourLayerBirthHead(nn.Module):
         return torch.cat(outs, dim=-1)
 
 
+class CameraUCPETargetAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, gamma_init: float = 0.0, norm_layer=nn.LayerNorm):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.dim // self.num_heads
+        self.norm_q = norm_layer(dim)
+        self.norm_kv = norm_layer(dim)
+        self.q = nn.Linear(dim, dim, bias=True)
+        self.kv = nn.Linear(dim, dim * 2, bias=True)
+        self.proj = nn.Linear(dim, dim, bias=True)
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init), dtype=torch.float32))
+
+    def forward(self, x_seq, geom_seq, T: int, hw: int, cond_tokens: int):
+        B, _, D = x_seq.shape
+        target_start = (int(T) - 1) * (int(cond_tokens) + int(hw)) + int(cond_tokens)
+        target_end = target_start + int(hw)
+        target = x_seq[:, target_start:target_end, :]
+        q = self.q(self.norm_q(target)).reshape(B, int(hw), self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv(self.norm_kv(geom_seq)).reshape(B, geom_seq.size(1), 2, self.num_heads, self.head_dim)
+        kv = kv.permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, int(hw), D)
+        out = self.proj(out)
+        gamma = self.gamma.to(device=out.device, dtype=out.dtype)
+        return torch.cat(
+            [
+                x_seq[:, :target_start, :],
+                x_seq[:, target_start:target_end, :] + gamma * out,
+                x_seq[:, target_end:, :],
+            ],
+            dim=1,
+        )
+
+
 class CameraConditionedPredictorAC(nn.Module):
     """
     Camera-pose-conditioned predictor with V-JEPA 2.1 hierarchical output heads.
@@ -246,12 +284,23 @@ class CameraConditionedPredictorAC(nn.Module):
         canvas_use_mask_feat_embed=True,
         canvas_use_token_type_embed=True,
         canvas_use_target_step_embed=True,
+        canvas_warp_mode="raw",
+        canvas_projector_gamma_init=0.0,
+        canvas_norm_clip_ratio=1.0,
+        canvas_block_mask_enabled=False,
+        canvas_block_mask_min_rects=1,
+        canvas_block_mask_max_rects=3,
+        canvas_block_mask_min_frac=0.2,
+        canvas_block_mask_max_frac=0.3,
         correspondence_bias_enabled=False,
         correspondence_bias_mode="rotation_homography",
         correspondence_bias_sigma_tokens=2.0,
         correspondence_bias_lambda_init=0.0,
         correspondence_bias_learnable=True,
         correspondence_bias_apply_layers=(0, 1, 2, 3, 4, 5),
+        camera_ucpe_enabled=False,
+        camera_ucpe_apply_layers=(0, 3, 6, 9),
+        camera_ucpe_gamma_init=0.0,
         **kwargs,
     ):
         super().__init__()
@@ -278,16 +327,18 @@ class CameraConditionedPredictorAC(nn.Module):
         #   ``"off"``               -- no token warping,
         #   ``"rotation_only"``     -- legacy rotation-only homography,
         #   ``"projective_probe"``  -- depth-aware projective warp using a
-        #                              frozen DA3-distilled depth probe).
+        #                              frozen DA3-distilled depth probe,
+        #   ``"projective_da3"``    -- depth-aware projective warp using
+        #                              externally supplied DA3 target depth).
         # The default ``"auto"`` derives the mode from ``warp_context_latents``
         # so every pre-Step-1 config / checkpoint produces bit-identical
         # behaviour: ``warp_context_latents=True`` ↔ ``"rotation_only"``;
         # ``warp_context_latents=False`` ↔ ``"off"``.
         if warp_mode == "auto":
             warp_mode = "rotation_only" if self.warp_context_latents else "off"
-        if warp_mode not in ("off", "rotation_only", "projective_probe"):
+        if warp_mode not in ("off", "rotation_only", "projective_probe", "projective_da3"):
             raise ValueError(
-                f"warp_mode must be one of {{off, rotation_only, projective_probe, auto}}; "
+                f"warp_mode must be one of {{off, rotation_only, projective_probe, projective_da3, auto}}; "
                 f"got {warp_mode!r}."
             )
         self.warp_mode = str(warp_mode)
@@ -406,6 +457,11 @@ class CameraConditionedPredictorAC(nn.Module):
         self._correspondence_bias_apply_layers_raw = tuple(int(i) for i in correspondence_bias_apply_layers)
         self._correspondence_bias_lambda_init = float(correspondence_bias_lambda_init)
         self._correspondence_bias_learnable = bool(correspondence_bias_learnable)
+        self.camera_ucpe_enabled = bool(camera_ucpe_enabled)
+        self._camera_ucpe_apply_layers_raw = tuple(int(i) for i in camera_ucpe_apply_layers)
+        self.camera_ucpe_gamma_init = float(camera_ucpe_gamma_init)
+        if self.camera_ucpe_enabled and not self.use_ray_pe:
+            raise ValueError("camera_ucpe_enabled=True requires use_ray_pe=True so dense camera geometry tokens are available.")
         self.fsq_total_code_axes = int(fsq_total_code_axes)
         self.fsq_levels = int(fsq_levels)
         self.predict_all = predict_all
@@ -420,6 +476,18 @@ class CameraConditionedPredictorAC(nn.Module):
         self.canvas_use_mask_feat_embed = bool(canvas_use_mask_feat_embed)
         self.canvas_use_token_type_embed = bool(canvas_use_token_type_embed)
         self.canvas_use_target_step_embed = bool(canvas_use_target_step_embed)
+        self.canvas_warp_mode = str(canvas_warp_mode).lower().strip()
+        if self.canvas_warp_mode not in ("raw", "projector", "norm_clip"):
+            raise ValueError(
+                f"canvas_warp_mode must be one of ('raw', 'projector', 'norm_clip'); got {self.canvas_warp_mode!r}."
+            )
+        self.canvas_projector_gamma_init = float(canvas_projector_gamma_init)
+        self.canvas_norm_clip_ratio = float(canvas_norm_clip_ratio)
+        self.canvas_block_mask_enabled = bool(canvas_block_mask_enabled)
+        self.canvas_block_mask_min_rects = max(1, int(canvas_block_mask_min_rects))
+        self.canvas_block_mask_max_rects = max(self.canvas_block_mask_min_rects, int(canvas_block_mask_max_rects))
+        self.canvas_block_mask_min_frac = max(0.0, min(1.0, float(canvas_block_mask_min_frac)))
+        self.canvas_block_mask_max_frac = max(self.canvas_block_mask_min_frac, min(1.0, float(canvas_block_mask_max_frac)))
         self._canvas_beta_init = (
             float(canvas_beta_init_valid),
             float(canvas_beta_init_boundary),
@@ -616,6 +684,10 @@ class CameraConditionedPredictorAC(nn.Module):
             self.canvas_mask_proj = nn.Linear(4, self.input_token_dim, bias=True)
             self.canvas_type_embed = nn.Embedding(3, self.input_token_dim)
             self.canvas_target_step_embed = nn.Embedding(max(1, num_frames // tubelet_size), self.input_token_dim)
+            if self.canvas_warp_mode == "projector":
+                self.canvas_warp_norm = nn.LayerNorm(self.input_token_dim)
+                self.canvas_warp_proj = nn.Linear(self.input_token_dim, self.input_token_dim, bias=True)
+                self.canvas_warp_gamma = nn.Parameter(torch.tensor(self.canvas_projector_gamma_init, dtype=torch.float32))
         if n_hierarchical_layers == 1:
             self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         else:
@@ -649,6 +721,27 @@ class CameraConditionedPredictorAC(nn.Module):
                 for i in range(depth)
             ]
         )
+        if self.camera_ucpe_enabled:
+            apply_set = set(self._camera_ucpe_apply_layers_raw)
+            invalid = [i for i in apply_set if i < 0 or i >= depth]
+            if invalid:
+                raise ValueError(
+                    f"camera_ucpe_apply_layers entries must be in [0, {depth}); got out-of-range indices {sorted(invalid)}"
+                )
+            self.camera_ucpe_apply_layers = tuple(sorted(apply_set))
+            self.camera_ucpe_branches = nn.ModuleDict(
+                {
+                    str(i): CameraUCPETargetAttention(
+                        dim=predictor_embed_dim,
+                        num_heads=num_heads,
+                        gamma_init=self.camera_ucpe_gamma_init,
+                        norm_layer=norm_layer,
+                    )
+                    for i in self.camera_ucpe_apply_layers
+                }
+            )
+        else:
+            self.camera_ucpe_apply_layers = tuple()
 
         # ------------------------------------------------------------------ #
         # Tier 2b — Output projection heads (V-JEPA 2.1 hierarchical)
@@ -788,6 +881,12 @@ class CameraConditionedPredictorAC(nn.Module):
                 self.canvas_mask_proj.bias.zero_()
                 self.canvas_type_embed.weight.zero_()
                 self.canvas_target_step_embed.weight.zero_()
+                if self.canvas_warp_mode == "projector":
+                    self.canvas_warp_gamma.fill_(self.canvas_projector_gamma_init)
+        if self.camera_ucpe_enabled:
+            with torch.no_grad():
+                for branch in self.camera_ucpe_branches.values():
+                    branch.gamma.fill_(self.camera_ucpe_gamma_init)
         self._rescale_blocks()
 
         # Pre-compute and register the block-causal attention mask.
@@ -971,6 +1070,33 @@ class CameraConditionedPredictorAC(nn.Module):
         K_inv[..., 2, 2] = 1.0
         return K_inv
 
+    def _prepare_target_depth(
+        self,
+        target_depth: torch.Tensor,
+        B: int,
+        HW: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        depth_t = target_depth.to(device=device, dtype=dtype)
+        if depth_t.dim() == 4 and depth_t.shape[1] == 1:
+            depth_t = depth_t[:, 0]
+        if depth_t.dim() == 3:
+            if depth_t.shape[-2:] != (self.grid_height, self.grid_width):
+                depth_t = F.interpolate(
+                    depth_t.unsqueeze(1).float(),
+                    size=(self.grid_height, self.grid_width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(device=device, dtype=dtype)[:, 0]
+            depth_t = depth_t.reshape(B, HW)
+        elif depth_t.dim() == 2:
+            if depth_t.shape != (B, HW):
+                raise ValueError(f"target_depth shape={tuple(depth_t.shape)} expected {(B, HW)}")
+        else:
+            raise ValueError(f"target_depth must be (B,HW), (B,H,W), or (B,1,H,W); got {tuple(depth_t.shape)}")
+        return depth_t.clamp_min(1.0e-3)
+
     def _warp_context_tokens(
         self,
         x_embed: torch.Tensor,
@@ -1057,11 +1183,9 @@ class CameraConditionedPredictorAC(nn.Module):
         # frame once per forward — only needed for the projective branch.
         # ``pts_world[b, n] = R_t @ (D_t[b, n] * K_t^{-1} u_t[n]) + t_t[b]``.
         pts_world = None
-        if self.warp_mode == "projective_probe" and target_depth is not None:
+        if self.warp_mode in ("projective_probe", "projective_da3") and target_depth is not None:
             rays_cam_t = torch.einsum("bij,nj->bni", K_t_inv, pixel_grid_t)  # (B, HW, 3)
-            depth_t = target_depth.to(dtype=dtype)
-            if depth_t.dim() == 3:
-                depth_t = depth_t.reshape(B, HW)
+            depth_t = self._prepare_target_depth(target_depth, B, HW, x_embed.device, dtype)
             pts_cam_t = rays_cam_t * depth_t.unsqueeze(-1)                   # (B, HW, 3)
             t_t_vec = states[:, -1, :3].to(dtype=dtype).unsqueeze(1)         # (B, 1, 3)
             pts_world = torch.einsum("bij,bnj->bni", R_t, pts_cam_t) + t_t_vec  # (B, HW, 3)
@@ -1081,7 +1205,7 @@ class CameraConditionedPredictorAC(nn.Module):
             H_inv = torch.bmm(K_c, torch.bmm(R_tc, K_t_inv))          # (B, 3, 3)
             src_h_rot = torch.einsum("bij,nj->bni", H_inv, pixel_grid_t)
 
-            if self.warp_mode == "projective_probe" and pts_world is not None:
+            if self.warp_mode in ("projective_probe", "projective_da3") and pts_world is not None:
                 t_c_vec = states[:, c, :3].to(dtype=dtype).unsqueeze(1)       # (B, 1, 3)
                 pts_cam_c = torch.einsum(
                     "bji,bnj->bni", R_c, pts_world - t_c_vec
@@ -1110,7 +1234,7 @@ class CameraConditionedPredictorAC(nn.Module):
 
             if (
                 depth_gate is not None
-                and self.warp_mode == "projective_probe"
+                and self.warp_mode in ("projective_probe", "projective_da3")
             ):
                 # Per-token blend: high-confidence (large gate) tokens use
                 # projective transport; low-confidence tokens fall back to
@@ -1186,10 +1310,8 @@ class CameraConditionedPredictorAC(nn.Module):
             dim=-1,
         )  # (HW, 3)
 
-        if self.warp_mode == "projective_probe" and target_depth is not None:
-            depth_t = target_depth.to(dtype=dtype)
-            if depth_t.dim() == 3:
-                depth_t = depth_t.reshape(B, HW)
+        if self.warp_mode in ("projective_probe", "projective_da3") and target_depth is not None:
+            depth_t = self._prepare_target_depth(target_depth, B, HW, x_raw.device, dtype)
             rays_cam_tgt = torch.einsum("bij,nj->bni", K_tgt_inv, pixel_grid_tgt)
             pts_cam_tgt = rays_cam_tgt * depth_t.unsqueeze(-1)
             t_tgt_vec = tgt_state[..., :3].unsqueeze(1)
@@ -1224,6 +1346,7 @@ class CameraConditionedPredictorAC(nn.Module):
         states: torch.Tensor,
         actions: torch.Tensor,
         intrinsics: torch.Tensor,
+        target_depth: torch.Tensor = None,
     ) -> dict:
         B, _, D = context_tokens_raw.shape
         HW = self.grid_height * self.grid_width
@@ -1232,7 +1355,8 @@ class CameraConditionedPredictorAC(nn.Module):
             dtype=context_tokens_raw.dtype,
         ).expand(B, HW, -1)
         x_full = torch.cat([context_tokens_raw, mask_tok], dim=1)
-        target_depth = None
+        external_target_depth = target_depth
+        target_depth = external_target_depth
         depth_gate = None
         if (
             self.warp_mode == "projective_probe"
@@ -1321,7 +1445,17 @@ class CameraConditionedPredictorAC(nn.Module):
             dtype=warped_context_raw.dtype,
         )
         beta = beta_values[type_ids].unsqueeze(-1)
-        target_canvas = beta * warped_context_raw + (1.0 - beta) * mask_tok
+        if self.canvas_warp_mode == "projector":
+            projected_delta = self.canvas_warp_proj(self.canvas_warp_norm(warped_context_raw))
+            gamma = self.canvas_warp_gamma.to(device=warped_context_raw.device, dtype=warped_context_raw.dtype)
+            canvas_warp = mask_tok + gamma * projected_delta
+        elif self.canvas_warp_mode == "norm_clip":
+            mask_norm_for_scale = mask_tok.norm(dim=-1, keepdim=True).mean().clamp_min(1.0e-6)
+            warp_norm_for_scale = warped_context_raw.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+            canvas_warp = warped_context_raw * ((mask_norm_for_scale * self.canvas_norm_clip_ratio) / warp_norm_for_scale)
+        else:
+            canvas_warp = warped_context_raw
+        target_canvas = beta * canvas_warp + (1.0 - beta) * mask_tok
         mask_embed = warped_context_raw.new_zeros(B, HW, D)
         type_embed = warped_context_raw.new_zeros(B, HW, D)
         step_embed = warped_context_raw.new_zeros(B, HW, D)
@@ -1337,6 +1471,9 @@ class CameraConditionedPredictorAC(nn.Module):
             step_ids = torch.full((B, HW), step_id, device=warped_context_raw.device, dtype=torch.long)
             step_embed = self.canvas_target_step_embed(step_ids)
             target_canvas = target_canvas + step_embed
+        block_mask = self._sample_canvas_block_mask(valid_mask)
+        if block_mask is not None:
+            target_canvas = torch.where(block_mask, mask_tok, target_canvas)
         with torch.no_grad():
             mask_norm = mask_tok.norm(dim=-1).mean().clamp_min(1.0e-6)
             self._last_canvas_diag = {
@@ -1346,13 +1483,52 @@ class CameraConditionedPredictorAC(nn.Module):
                 "beta_valid": float(beta_values[0].detach().item()),
                 "beta_boundary": float(beta_values[1].detach().item()),
                 "beta_oov": float(beta_values[2].detach().item()),
-                "input_norm_ratio": float((warped_context_raw.norm(dim=-1).mean() / mask_norm).detach().item()),
-                "warp_norm": float(warped_context_raw.norm(dim=-1).mean().detach().item()),
+                "canvas_norm": float(target_canvas.norm(dim=-1).mean().detach().item()),
                 "mask_token_norm": float(mask_norm.detach().item()),
+                "warp_norm": float(warped_context_raw.norm(dim=-1).mean().detach().item()),
+                "input_norm_ratio": float((warped_context_raw.norm(dim=-1).mean() / mask_norm).detach().item()),
+                "canvas_warp_norm": float(canvas_warp.norm(dim=-1).mean().detach().item()),
+                "canvas_warp_norm_ratio": float((canvas_warp.norm(dim=-1).mean() / mask_norm).detach().item()),
                 "mask_embed_norm": float(mask_embed.norm(dim=-1).mean().detach().item()),
                 "type_embed_norm": float(type_embed.norm(dim=-1).mean().detach().item()),
+                "block_mask_frac": float(block_mask.to(dtype=valid_mask.dtype).mean().detach().item()) if block_mask is not None else 0.0,
             }
         return target_canvas
+
+    def _sample_canvas_block_mask(self, valid_mask: torch.Tensor) -> torch.Tensor | None:
+        if not (self.training and self.canvas_block_mask_enabled):
+            return None
+        B, HW, _ = valid_mask.shape
+        gh, gw = self.grid_height, self.grid_width
+        if HW != gh * gw:
+            return None
+        valid_bool = valid_mask.reshape(B, gh, gw) > 0.5
+        if not bool(valid_bool.any().item()):
+            return None
+        mask = torch.zeros(B, gh, gw, device=valid_mask.device, dtype=torch.bool)
+        min_area = max(1, int(round(float(HW) * self.canvas_block_mask_min_frac)))
+        max_area = max(min_area, int(round(float(HW) * self.canvas_block_mask_max_frac)))
+        for b in range(B):
+            n_valid = int(valid_bool[b].sum().item())
+            if n_valid <= 0:
+                continue
+            target_area = min(n_valid, int(torch.randint(min_area, max_area + 1, (1,), device=valid_mask.device).item()))
+            n_rects = int(torch.randint(self.canvas_block_mask_min_rects, self.canvas_block_mask_max_rects + 1, (1,), device=valid_mask.device).item())
+            for r in range(n_rects):
+                remaining = target_area - int((mask[b] & valid_bool[b]).sum().item())
+                if remaining <= 0:
+                    break
+                rect_area = max(1, remaining // max(1, n_rects - r))
+                rect_h = int(torch.randint(1, gh + 1, (1,), device=valid_mask.device).item())
+                rect_w = max(1, min(gw, int(math.ceil(rect_area / rect_h))))
+                rect_h = max(1, min(gh, int(math.ceil(rect_area / rect_w))))
+                y0 = int(torch.randint(0, gh - rect_h + 1, (1,), device=valid_mask.device).item())
+                x0 = int(torch.randint(0, gw - rect_w + 1, (1,), device=valid_mask.device).item())
+                mask[b, y0:y0 + rect_h, x0:x0 + rect_w] = True
+            mask[b] &= valid_bool[b]
+        if not bool(mask.any().item()):
+            return None
+        return mask.reshape(B, HW, 1)
 
     @staticmethod
     def _compose_state_action(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
@@ -1623,7 +1799,7 @@ class CameraConditionedPredictorAC(nn.Module):
     # Forward
     # ---------------------------------------------------------------------- #
 
-    def forward(self, x, actions, states, intrinsics=None):
+    def forward(self, x, actions, states, intrinsics=None, target_depth=None):
         """
         Args:
             x: Visual context tokens from the (target) encoder.
@@ -1659,7 +1835,8 @@ class CameraConditionedPredictorAC(nn.Module):
         # from DA3 with a single global α scalar baked into the checkpoint.
         # Output ``target_depth`` has shape ``(B, HW)`` and is in the same
         # pose-consistent units that ``_warp_context_tokens`` expects.
-        target_depth = None
+        external_target_depth = target_depth
+        target_depth = external_target_depth
         depth_gate = None
         if (
             self.warp_mode == "projective_probe"
@@ -1752,6 +1929,7 @@ class CameraConditionedPredictorAC(nn.Module):
             x_raw, states, actions, intrinsics, target_depth=target_depth
         )
 
+        ray_embed = None
         if self.use_ray_pe and intrinsics is not None:
             ray_embed = self._compute_ray_pe(intrinsics, states, B, T, D)
             x_with_ray = x.view(B, T, self.grid_height * self.grid_width, D)
@@ -1904,6 +2082,16 @@ class CameraConditionedPredictorAC(nn.Module):
                     H=self.grid_height,
                     W=self.grid_width,
                     action_tokens=self.cond_tokens,
+                )
+            if self.camera_ucpe_enabled and block_idx in self.camera_ucpe_apply_layers:
+                if ray_embed is None:
+                    raise RuntimeError("camera_ucpe_enabled=True requires ray_embed in forward().")
+                x_seq = self.camera_ucpe_branches[str(block_idx)](
+                    x_seq,
+                    ray_embed.flatten(1, 2),
+                    T,
+                    self.grid_height * self.grid_width,
+                    self.cond_tokens,
                 )
 
         # -- split conditioning slots from visual patch slots
