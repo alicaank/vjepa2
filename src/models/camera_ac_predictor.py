@@ -477,9 +477,9 @@ class CameraConditionedPredictorAC(nn.Module):
         self.canvas_use_token_type_embed = bool(canvas_use_token_type_embed)
         self.canvas_use_target_step_embed = bool(canvas_use_target_step_embed)
         self.canvas_warp_mode = str(canvas_warp_mode).lower().strip()
-        if self.canvas_warp_mode not in ("raw", "projector", "norm_clip"):
+        if self.canvas_warp_mode not in ("raw", "projector", "norm_clip", "rot_gated"):
             raise ValueError(
-                f"canvas_warp_mode must be one of ('raw', 'projector', 'norm_clip'); got {self.canvas_warp_mode!r}."
+                f"canvas_warp_mode must be one of ('raw', 'projector', 'norm_clip', 'rot_gated'); got {self.canvas_warp_mode!r}."
             )
         self.canvas_projector_gamma_init = float(canvas_projector_gamma_init)
         self.canvas_norm_clip_ratio = float(canvas_norm_clip_ratio)
@@ -1421,7 +1421,15 @@ class CameraConditionedPredictorAC(nn.Module):
         boundary_mask: torch.Tensor = None,
         confidence_mask: torch.Tensor = None,
         rollout_step: int = 0,
+        rot_weight: torch.Tensor = None,
     ) -> torch.Tensor:
+        """Build the canvas target slot for canvas_first mode.
+
+        Args:
+            rot_weight: optional (B,) float tensor in [0, 1] used by
+                canvas_warp_mode='rot_gated' to scale beta_valid per sample
+                by the rotation dominance score.  Ignored for other modes.
+        """
         B, HW, D = warped_context_raw.shape
         mask_tok = self.future_mask_token.to(
             device=warped_context_raw.device,
@@ -1445,6 +1453,13 @@ class CameraConditionedPredictorAC(nn.Module):
             dtype=warped_context_raw.dtype,
         )
         beta = beta_values[type_ids].unsqueeze(-1)
+        if self.canvas_warp_mode == "rot_gated" and rot_weight is not None:
+            # Scale beta_valid (type_id == 0) per sample by rotation dominance.
+            # beta_boundary and beta_oov are kept as-is.
+            rw = rot_weight.to(device=warped_context_raw.device, dtype=warped_context_raw.dtype)
+            rw = rw.clamp(0.0, 1.0).reshape(B, 1, 1)
+            valid_tok = (type_ids == 0).unsqueeze(-1)
+            beta = torch.where(valid_tok, beta * rw, beta)
         if self.canvas_warp_mode == "projector":
             projected_delta = self.canvas_warp_proj(self.canvas_warp_norm(warped_context_raw))
             gamma = self.canvas_warp_gamma.to(device=warped_context_raw.device, dtype=warped_context_raw.dtype)
@@ -1489,6 +1504,7 @@ class CameraConditionedPredictorAC(nn.Module):
                 "input_norm_ratio": float((warped_context_raw.norm(dim=-1).mean() / mask_norm).detach().item()),
                 "canvas_warp_norm": float(canvas_warp.norm(dim=-1).mean().detach().item()),
                 "canvas_warp_norm_ratio": float((canvas_warp.norm(dim=-1).mean() / mask_norm).detach().item()),
+                "rot_weight_mean": float(rot_weight.mean().detach().item()) if rot_weight is not None else 1.0,
                 "mask_embed_norm": float(mask_embed.norm(dim=-1).mean().detach().item()),
                 "type_embed_norm": float(type_embed.norm(dim=-1).mean().detach().item()),
                 "block_mask_frac": float(block_mask.to(dtype=valid_mask.dtype).mean().detach().item()) if block_mask is not None else 0.0,

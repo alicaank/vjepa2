@@ -11,6 +11,7 @@
 #   3. Call target_encoder with training_mode=True for multi-layer features
 #   4. Compute V-JEPA 2.1 hierarchical dense predictive loss
 
+import contextlib
 import json
 import logging
 import os
@@ -72,6 +73,11 @@ except Exception:
 # the same vjepa2 subtree as the predictor, so this never falls back. See
 # ``docs/TRANSPORT_CORRECT_REVERSE_DESIGN.md`` §5.
 from src.models.latent_corrector import build_latent_corrector  # noqa: E402
+from src.models.latent_patchgan import (  # noqa: E402
+    LatentPatchDiscriminator,
+    latent_patchgan_hinge_discriminator_loss,
+    latent_patchgan_hinge_generator_loss,
+)
 
 log_timings = True
 log_freq = 100
@@ -339,6 +345,34 @@ def _rotation_unseen_boundary_mask(
     return (1.0 - valid) * outside_near_boundary
 
 
+def _canvas_rot_weight(
+    local_actions_window: torch.Tensor,
+    dtype: torch.dtype,
+    eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """Compute per-sample rotation dominance score from the incoming action.
+
+    Returns a (B,) tensor in [0, 1] where 1.0 = pure rotation, 0.0 = pure
+    translation.  Used by canvas_warp_mode='rot_gated' to scale beta_valid.
+
+    The incoming action into the target step is local_actions_window[:, -2]
+    (dataset convention: actions[t] encodes t→t+1; the last slot is zero-
+    padded, so -2 is the last real action).
+
+    Rotation magnitude: geodesic angle = 2 * arccos(|qw|).
+    Translation magnitude: Euclidean norm of [tx, ty, tz].
+    """
+    if local_actions_window is None or local_actions_window.shape[1] < 2:
+        B = local_actions_window.shape[0] if local_actions_window is not None else 1
+        return torch.ones(B, dtype=dtype)
+    action = local_actions_window[:, -2].to(dtype=dtype)  # (B, 7)
+    t_mag = action[:, :3].norm(dim=-1)                    # (B,)
+    qw = action[:, 6].clamp(-1.0 + eps, 1.0 - eps)
+    rot_angle = 2.0 * torch.arccos(qw.abs())              # (B,) in [0, pi]
+    rot_score = rot_angle / (rot_angle + t_mag + eps)
+    return rot_score.clamp(0.0, 1.0)
+
+
 def _depth_visibility_region_masks(
     predictor_ref,
     local_states_canon: torch.Tensor,
@@ -550,6 +584,14 @@ def _normalize_and_concat(h, embed_dim):
     return torch.cat(chunks, dim=-1)
 
 
+def _set_module_requires_grad(module, requires_grad: bool) -> None:
+    if module is None:
+        return
+    target = module.module if hasattr(module, "module") else module
+    for param in target.parameters():
+        param.requires_grad_(requires_grad)
+
+
 def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
@@ -671,6 +713,10 @@ def main(args, resume_preempt=False):
     canvas_block_mask_max_rects = int(cfgs_model.get("canvas_block_mask_max_rects", 3))
     canvas_block_mask_min_frac = float(cfgs_model.get("canvas_block_mask_min_frac", 0.2))
     canvas_block_mask_max_frac = float(cfgs_model.get("canvas_block_mask_max_frac", 0.3))
+    # LM7: use DA3 depth warp boundary as canvas boundary mask instead of the
+    # rotation-homography approximation.  Requires DA3 depth to be loaded
+    # (triggered automatically when canvas_boundary_source == "da3").
+    canvas_boundary_source = str(cfgs_model.get("canvas_boundary_source", "rotation"))
     camera_ucpe_enabled = bool(cfgs_model.get("camera_ucpe_enabled", False))
     camera_ucpe_apply_layers = tuple(int(i) for i in cfgs_model.get("camera_ucpe_apply_layers", [0, 3, 6, 9]))
     camera_ucpe_gamma_init = float(cfgs_model.get("camera_ucpe_gamma_init", 0.0))
@@ -867,13 +913,49 @@ def main(args, resume_preempt=False):
         cfgs_completion.get("da3_model_id", "depth-anything/DA3-GIANT-1.1")
     )
     completion_da3_depth_res = int(cfgs_completion.get("da3_depth_res", crop_size))
+    cfgs_latent_patchgan = cfgs_loss.get("latent_patchgan", {}) or {}
+    latent_patchgan_enabled = bool(cfgs_latent_patchgan.get("enabled", False))
+    latent_patchgan_weight = float(cfgs_latent_patchgan.get("weight", 0.0))
+    latent_patchgan_discriminator_weight = float(
+        cfgs_latent_patchgan.get("discriminator_weight", 1.0)
+    )
+    latent_patchgan_lr = float(cfgs_latent_patchgan.get("lr", 1.0e-4))
+    latent_patchgan_hidden_dim = int(cfgs_latent_patchgan.get("hidden_dim", 256))
+    latent_patchgan_layers = int(cfgs_latent_patchgan.get("layers", 3))
+    latent_patchgan_start_epoch = int(cfgs_latent_patchgan.get("start_epoch", 0))
+    latent_patchgan_ramp_epochs = int(cfgs_latent_patchgan.get("ramp_epochs", 0))
+    latent_patchgan_mask_source = str(
+        cfgs_latent_patchgan.get("mask_source", "da3")
+    ).lower()
+    if latent_patchgan_mask_source not in ("da3", "rotation"):
+        raise ValueError(
+            "loss.latent_patchgan.mask_source must be 'da3' or 'rotation'; "
+            f"got {latent_patchgan_mask_source!r}"
+        )
+    latent_patchgan_train_discriminator = bool(
+        cfgs_latent_patchgan.get("train_discriminator", True)
+    )
+    latent_patchgan_input_layer_norm = bool(
+        cfgs_latent_patchgan.get("input_layer_norm", False)
+    )
+    latent_patchgan_spectral_norm = bool(
+        cfgs_latent_patchgan.get("spectral_norm", True)
+    )
+    latent_patchgan_beta1 = float(cfgs_latent_patchgan.get("beta1", 0.0))
+    latent_patchgan_beta2 = float(cfgs_latent_patchgan.get("beta2", 0.99))
     da3_warp_enabled = warp_mode == "projective_da3"
+    canvas_da3_boundary_enabled = (
+        target_slot_mode == "canvas_first" and canvas_boundary_source == "da3"
+    )
     if completion_enabled and not use_completion_head:
         logger.warning(
             "loss.completion.enabled=True but model.use_completion_head=False; "
             "enabling the masked region metrics but skipping completion-head loss."
         )
-    if ((completion_enabled and completion_mask_source == "da3") or da3_warp_enabled) and not _DEPTH_TEACHER_AVAILABLE:
+    latent_patchgan_da3_enabled = (
+        latent_patchgan_enabled and latent_patchgan_mask_source == "da3"
+    )
+    if ((completion_enabled and completion_mask_source == "da3") or da3_warp_enabled or canvas_da3_boundary_enabled or latent_patchgan_da3_enabled) and not _DEPTH_TEACHER_AVAILABLE:
         raise ImportError(
             "DA3 depth usage requires src.training.common.depth_teacher."
         )
@@ -1324,6 +1406,35 @@ def main(args, resume_preempt=False):
     else:
         logger.info("Phase C latent corrector: disabled.")
 
+    latent_patchgan = None
+    if latent_patchgan_enabled:
+        _pred_for_patchgan_dims = predictor.module if hasattr(predictor, "module") else predictor
+        _patchgan_layer_dim = getattr(_pred_for_patchgan_dims, "out_embed_dim", None)
+        if _patchgan_layer_dim is None:
+            raise RuntimeError(
+                "Latent PatchGAN needs predictor.out_embed_dim to infer the "
+                "concatenated hierarchical token width."
+            )
+        latent_patchgan_in_dim = int(n_hierarchical_layers) * int(_patchgan_layer_dim)
+        latent_patchgan = LatentPatchDiscriminator(
+            in_dim=latent_patchgan_in_dim,
+            hidden_dim=latent_patchgan_hidden_dim,
+            n_layers=latent_patchgan_layers,
+            input_layer_norm=latent_patchgan_input_layer_norm,
+            spectral_norm=latent_patchgan_spectral_norm,
+        ).to(device)
+        if not latent_patchgan_train_discriminator:
+            latent_patchgan.eval()
+            _set_module_requires_grad(latent_patchgan, False)
+        n_patchgan_params = sum(p.numel() for p in latent_patchgan.parameters())
+        logger.info(
+            "Latent PatchGAN discriminator params=%d token_dim=%d grid=%dx%d.",
+            n_patchgan_params,
+            latent_patchgan_in_dim,
+            crop_size // patch_size,
+            crop_size // patch_size,
+        )
+
     completion_depth_teacher = None
     completion_depth_processor = None
     if completion_enabled:
@@ -1338,7 +1449,26 @@ def main(args, resume_preempt=False):
             completion_depth_tau,
             completion_boundary_dilate,
         )
-    if (completion_enabled and completion_mask_source == "da3") or da3_warp_enabled:
+    if latent_patchgan_enabled:
+        logger.info(
+            "Latent PatchGAN: enabled weight=%.4f d_weight=%.4f mask_source=%s "
+            "lr=%.2e hidden=%d layers=%d start_epoch=%d ramp_epochs=%d "
+            "train_D=%s input_ln=%s spectral_norm=%s",
+            latent_patchgan_weight,
+            latent_patchgan_discriminator_weight,
+            latent_patchgan_mask_source,
+            latent_patchgan_lr,
+            latent_patchgan_hidden_dim,
+            latent_patchgan_layers,
+            latent_patchgan_start_epoch,
+            latent_patchgan_ramp_epochs,
+            latent_patchgan_train_discriminator,
+            latent_patchgan_input_layer_norm,
+            latent_patchgan_spectral_norm,
+        )
+    else:
+        logger.info("Latent PatchGAN: disabled.")
+    if (completion_enabled and completion_mask_source == "da3") or da3_warp_enabled or canvas_da3_boundary_enabled or latent_patchgan_da3_enabled:
         if load_depth_teacher is None:
             raise RuntimeError("DA3 depth requested but depth teacher loader is unavailable.")
         completion_depth_processor, completion_depth_teacher = load_depth_teacher(
@@ -1346,11 +1476,13 @@ def main(args, resume_preempt=False):
             model_id=completion_da3_model_id,
         )
         logger.info(
-            "DA3 depth teacher: model=%s depth_res=%d completion_masks=%s warp=%s",
+            "DA3 depth teacher: model=%s depth_res=%d completion_masks=%s warp=%s canvas_boundary=%s patchgan=%s",
             completion_da3_model_id,
             completion_da3_depth_res,
             completion_enabled and completion_mask_source == "da3",
             da3_warp_enabled,
+            canvas_da3_boundary_enabled,
+            latent_patchgan_da3_enabled,
         )
 
     if compile_model:
@@ -1437,6 +1569,22 @@ def main(args, resume_preempt=False):
         ipe = _dlen
     logger.info(f"iterations per epoch/dataset length: {ipe}/{_dlen}")
 
+    # Freeze context encoder before optimizer construction so its parameters
+    # are excluded from AdamW param groups entirely (no moment allocation,
+    # no zero-gradient step overhead). The enc_lr_scale<=0 path previously
+    # did this after init_opt, which wasted ~2.4 GB optimizer state on ViT-L
+    # (8.8 GB on ViT-G) and added a small per-step cost.
+    context_encoder_frozen = float(enc_lr_scale) <= 0.0
+    if context_encoder_frozen:
+        for p in encoder.parameters():
+            p.requires_grad = False
+        encoder.eval()
+        logger.info(
+            "Context encoder frozen (enc_lr_scale=%.3f <= 0): "
+            "parameters set requires_grad=False and module.eval() called.",
+            float(enc_lr_scale),
+        )
+
     # -- init optimizer
     # Phase C: corrector is appended as an additional param group when
     # enabled. In ``frozen_predictor`` mode encoder + predictor params have
@@ -1509,6 +1657,9 @@ def main(args, resume_preempt=False):
             # safer until we verify static-graph compatibility.
             corrector = DistributedDataParallel(corrector)
             logger.info("Wrapped corrector with DistributedDataParallel.")
+        if latent_patchgan is not None and _has_trainable_params(latent_patchgan):
+            latent_patchgan = DistributedDataParallel(latent_patchgan)
+            logger.info("Wrapped latent PatchGAN discriminator with DistributedDataParallel.")
     else:
         if world_size > 1:
             logger.warning(
@@ -1520,25 +1671,13 @@ def main(args, resume_preempt=False):
     for p in target_encoder.parameters():
         p.requires_grad = False
     predictor_ref = predictor.module if hasattr(predictor, "module") else predictor
-
-    # Paper-faithful V-JEPA 2-AC: when the context-encoder LR scale is 0 we
-    # also disable its gradients so the backward pass actually skips the
-    # encoder (~30% step-time reduction + encoder-sized gradient VRAM saved).
-    # Without this guard AdamW would still compute encoder grads and then
-    # zero-update them — wasteful.
-    context_encoder_frozen = float(enc_lr_scale) <= 0.0
-    if context_encoder_frozen:
-        for p in encoder.parameters():
-            p.requires_grad = False
-        # eval() disables dropout / stochastic-depth inside ViT blocks so
-        # context features are deterministic — matches the target encoder
-        # regime and guarantees context == target outputs at init (paper
-        # figure's identical "frozen encoder" boxes).
-        encoder.eval()
-        logger.info(
-            "Context encoder frozen (enc_lr_scale=%.3f <= 0): "
-            "parameters set requires_grad=False and module.eval() called.",
-            float(enc_lr_scale),
+    latent_patchgan_optimizer = None
+    if latent_patchgan is not None and latent_patchgan_train_discriminator:
+        latent_patchgan_optimizer = torch.optim.AdamW(
+            [p for p in latent_patchgan.parameters() if p.requires_grad],
+            lr=latent_patchgan_lr,
+            betas=(latent_patchgan_beta1, latent_patchgan_beta2),
+            weight_decay=0.0,
         )
 
     logger.info(
@@ -1564,27 +1703,33 @@ def main(args, resume_preempt=False):
         )
 
     # -- load pretrained encoder weights
-    # MASt3R adapter loaded its own pretrained weights via
-    # ``AsymmetricMASt3R.from_pretrained``, so the V-JEPA pretrain
-    # checkpoint must not be re-applied to the encoder. We still let
-    # ``load_pretrained`` run so it can warm-start the predictor when
+    # Adapter backbones load their own pretrained weights, so the V-JEPA
+    # pretrain checkpoint must not be re-applied to the encoder. We still
+    # let ``load_pretrained`` run so it can warm-start the predictor when
     # ``load_predictor=True``; just disable the encoder side.
-    _load_encoder_effective = load_encoder and (encoder_backbone != "mast3r")
-    if encoder_backbone == "mast3r" and load_encoder:
+    _adapter_backbones = {"mast3r", "cradio"}
+    _load_encoder_effective = load_encoder and (encoder_backbone not in _adapter_backbones)
+    if encoder_backbone in _adapter_backbones and load_encoder:
         logger.info(
-            "encoder_backbone=mast3r: skipping load_pretrained on encoder/target_encoder "
-            "(MASt3R weights already loaded inside MASt3REncoderAdapter)."
+            f"encoder_backbone={encoder_backbone}: skipping load_pretrained on "
+            "encoder/target_encoder (adapter weights are already loaded)."
         )
-    encoder, predictor, target_encoder = load_pretrained(
-        r_path=p_file,
-        encoder=encoder,
-        predictor=predictor,
-        target_encoder=target_encoder,
-        context_encoder_key=context_encoder_key,
-        target_encoder_key=target_encoder_key,
-        load_predictor=load_predictor,
-        load_encoder=_load_encoder_effective,
-    )
+    if _load_encoder_effective or load_predictor:
+        encoder, predictor, target_encoder = load_pretrained(
+            r_path=p_file,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            context_encoder_key=context_encoder_key,
+            target_encoder_key=target_encoder_key,
+            load_predictor=load_predictor,
+            load_encoder=_load_encoder_effective,
+        )
+    else:
+        logger.info(
+            "Skipping load_pretrained entirely: no encoder/predictor weights "
+            "requested for this backbone."
+        )
 
     def _remove_file(path):
         try:
@@ -1703,6 +1848,10 @@ def main(args, resume_preempt=False):
         }
         if corrector is not None:
             payload["corrector"] = _unwrapped_state_dict(corrector)
+        if latent_patchgan is not None:
+            payload["latent_patchgan"] = _unwrapped_state_dict(latent_patchgan)
+        if latent_patchgan_optimizer is not None:
+            payload["latent_patchgan_opt"] = latent_patchgan_optimizer.state_dict()
         return payload
 
     def _build_weights_only_payload(epoch, *, include_target_encoder):
@@ -1722,6 +1871,24 @@ def main(args, resume_preempt=False):
             # Corrector weights are tiny (≤5M params); keep at fp32 for
             # numerical headroom on the residual scales.
             payload["corrector"] = _unwrapped_state_dict(corrector)
+        if latent_patchgan is not None:
+            payload["latent_patchgan"] = _compact_state_dict(_unwrapped_state_dict(latent_patchgan))
+        return payload
+
+    def _build_predictor_only_payload(epoch):
+        payload = {
+            "predictor": _compact_state_dict(_unwrapped_state_dict(predictor)),
+            "epoch": epoch,
+            "loss": loss_meter.avg,
+            "batch_size": batch_size,
+            "world_size": world_size,
+            "lr": lr,
+            "checkpoint_type": "weights_only_bf16_predictor",
+        }
+        if corrector is not None:
+            payload["corrector"] = _unwrapped_state_dict(corrector)
+        if latent_patchgan is not None:
+            payload["latent_patchgan"] = _compact_state_dict(_unwrapped_state_dict(latent_patchgan))
         return payload
 
     def _write_checkpoint_payload(payload, path, *, tag):
@@ -1770,6 +1937,8 @@ def main(args, resume_preempt=False):
             opt=optimizer,
             scaler=scaler,
             corrector=corrector,
+            latent_patchgan=latent_patchgan,
+            latent_patchgan_opt=latent_patchgan_optimizer,
         )
         for _ in range(start_epoch * ipe):
             scheduler.step()
@@ -1813,6 +1982,12 @@ def main(args, resume_preempt=False):
         if rank != 0:
             return False
         _purge_runtime_caches()
+        if checkpoint_save_mode == "weights_only_predictor":
+            return _write_checkpoint_payload(
+                _build_predictor_only_payload(epoch),
+                path,
+                tag="weights-only-bf16-predictor",
+            )
         if checkpoint_save_mode == "weights_only_no_target":
             return _write_checkpoint_payload(
                 _build_weights_only_payload(epoch, include_target_encoder=False),
@@ -1927,6 +2102,14 @@ def main(args, resume_preempt=False):
         training_stats["completion_visible_frac"] = []
         training_stats["completion_boundary_frac"] = []
         training_stats["completion_disoccluded_frac"] = []
+    if latent_patchgan_enabled:
+        training_stats["patchgan_g"] = []
+        training_stats["patchgan_d"] = []
+        training_stats["patchgan_weight"] = []
+        training_stats["patchgan_reveal_frac"] = []
+        training_stats["patchgan_pred_norm"] = []
+        training_stats["patchgan_tgt_norm"] = []
+        training_stats["patchgan_norm_ratio"] = []
     if target_slot_mode == "canvas_first":
         training_stats["canvas_valid_frac"] = []
         training_stats["canvas_oov_frac"] = []
@@ -2150,6 +2333,12 @@ def main(args, resume_preempt=False):
                     h_ctx.dtype,
                     intermediate_unseen_boundary_band,
                 )
+                eval_rot_weight = None
+                if canvas_warp_mode == "rot_gated":
+                    eval_rot_weight = _canvas_rot_weight(
+                        local_actions_eval_canvas,
+                        dtype=h_ctx.dtype,
+                    ).to(device=device)
                 future_tokens_v = _pred.prepare_canvas_slot(
                     warped_context_raw=canvas_inputs_v["warped_context_raw"],
                     valid_mask=canvas_inputs_v["valid_mask"],
@@ -2157,6 +2346,7 @@ def main(args, resume_preempt=False):
                     boundary_mask=boundary_v,
                     confidence_mask=canvas_inputs_v["confidence_mask"],
                     rollout_step=max(0, target_idx - 1),
+                    rot_weight=eval_rot_weight,
                 )
             else:
                 future_tokens_v = _pred.future_mask_token.to(device=device, dtype=h_ctx.dtype).expand(
@@ -2540,6 +2730,12 @@ def main(args, resume_preempt=False):
         loss_corr_step_meter = AverageMeter()
         loss_corr_denoise_meter = AverageMeter()
         loss_completion_meter = AverageMeter()
+        patchgan_g_meter = AverageMeter()
+        patchgan_d_meter = AverageMeter()
+        patchgan_reveal_frac_meter = AverageMeter()
+        patchgan_pred_norm_meter = AverageMeter()
+        patchgan_tgt_norm_meter = AverageMeter()
+        patchgan_norm_ratio_meter = AverageMeter()
         completion_visible_meter = AverageMeter()
         completion_boundary_meter = AverageMeter()
         completion_disoccluded_meter = AverageMeter()
@@ -2658,6 +2854,31 @@ def main(args, resume_preempt=False):
         else:
             _correspondence_bias_ramp_now = 0.0
 
+        if latent_patchgan_enabled:
+            if epoch < latent_patchgan_start_epoch:
+                _latent_patchgan_weight_now = 0.0
+            elif latent_patchgan_ramp_epochs > 0:
+                # Epochs in the loop are zero-based, while logs/checkpoints are
+                # human-facing one-based. Treat ``start_epoch`` as the first
+                # active epoch so start=0 gives a small nonzero weight in
+                # logged Epoch 1 instead of waiting until Epoch 2.
+                _pg_ramp = (
+                    float(epoch - latent_patchgan_start_epoch + 1)
+                    / float(max(1, latent_patchgan_ramp_epochs))
+                )
+                _latent_patchgan_weight_now = latent_patchgan_weight * min(1.0, max(0.0, _pg_ramp))
+            else:
+                _latent_patchgan_weight_now = latent_patchgan_weight
+            if latent_patchgan is not None:
+                if latent_patchgan_train_discriminator:
+                    latent_patchgan.train()
+                else:
+                    latent_patchgan.eval()
+        else:
+            _latent_patchgan_weight_now = 0.0
+
+        predictor_ref = predictor.module if hasattr(predictor, "module") else predictor
+
         for itr in range(ipe):
             itr_start_time = time.time()
 
@@ -2718,7 +2939,14 @@ def main(args, resume_preempt=False):
                     # layers gives (B, T_tok*HW, sum_D). Works for both the
                     # image path (tubelet_size=1) and the legacy video path
                     # (tubelet_size=2).
-                    h_target = _layerlist_to_h(target_encoder(full_clip))
+                    _enc_dtype = torch.bfloat16 if mixed_precision else None
+                    _enc_ctx = (
+                        torch.amp.autocast("cuda", dtype=_enc_dtype)
+                        if _enc_dtype is not None
+                        else contextlib.nullcontext()
+                    )
+                    with _enc_ctx:
+                        h_target = _layerlist_to_h(target_encoder(full_clip))
                     h_target_tubelets = [
                         h_target[:, tubelet_idx * HW:(tubelet_idx + 1) * HW, :]
                         for tubelet_idx in range(total_tubelets)
@@ -2739,7 +2967,15 @@ def main(args, resume_preempt=False):
                 ctx_frame_start = local_start * tubelet_size
                 ctx_frame_end = (local_start + k_ctx) * tubelet_size
                 ctx_clip = imgs[:, ctx_frame_start:ctx_frame_end, :, :, :].permute(0, 2, 1, 3, 4)
-                ctx_layer_outs = encoder(ctx_clip)
+                with torch.no_grad():
+                    _enc_dtype = torch.bfloat16 if mixed_precision else None
+                    _enc_ctx = (
+                        torch.amp.autocast("cuda", dtype=_enc_dtype)
+                        if _enc_dtype is not None
+                        else contextlib.nullcontext()
+                    )
+                    with _enc_ctx:
+                        ctx_layer_outs = encoder(ctx_clip)
                 h_context = torch.cat(ctx_layer_outs, dim=-1)
                 context_latents = [
                     h_context[:, tubelet_idx * HW:(tubelet_idx + 1) * HW, :]
@@ -2748,7 +2984,7 @@ def main(args, resume_preempt=False):
                 predictor_ref = predictor.module if hasattr(predictor, "module") else predictor
                 completion_depths = None
                 da3_depths = None
-                if (completion_enabled and completion_mask_source == "da3") or da3_warp_enabled:
+                if (completion_enabled and completion_mask_source == "da3") or da3_warp_enabled or canvas_da3_boundary_enabled or latent_patchgan_da3_enabled:
                     if completion_depth_teacher is None or compute_teacher_depths_batch_with_confidence is None:
                         raise RuntimeError("DA3 depth requested but depth teacher is not initialized.")
                     with torch.no_grad():
@@ -2775,7 +3011,7 @@ def main(args, resume_preempt=False):
                             W=W,
                         )
                         da3_depths = depth_maps.reshape(B, total_tubelets, H, W)
-                        if completion_enabled and completion_mask_source == "da3":
+                        if (completion_enabled and completion_mask_source == "da3") or latent_patchgan_da3_enabled:
                             completion_depths = da3_depths
 
                 def forward_predictor_with_trajectory(
@@ -2817,14 +3053,50 @@ def main(args, resume_preempt=False):
                             local_intrinsics_window,
                             target_depth=target_depth,
                         )
-                        boundary_canvas = _rotation_unseen_boundary_mask(
-                            predictor_ref,
-                            local_states_canon,
-                            local_intrinsics_window,
-                            HW,
-                            h_context_step.dtype,
-                            intermediate_unseen_boundary_band,
-                        )
+                        # LM7: DA3 depth-based boundary as canvas side-conditioning.
+                        # Falls back to rotation-homography when da3_depths is None.
+                        if canvas_da3_boundary_enabled and da3_depths is not None:
+                            src_tubelet = max(0, rollout_step - 1) if rollout_step > 0 else 0
+                            tgt_tubelet = min(rollout_step, da3_depths.shape[1] - 1)
+                            da3_masks = _depth_visibility_region_masks(
+                                predictor_ref,
+                                local_states_canon,
+                                local_intrinsics_window,
+                                da3_depths[:, src_tubelet],
+                                da3_depths[:, tgt_tubelet],
+                                HW,
+                                h_context_step.dtype,
+                                completion_depth_tau,
+                                completion_boundary_dilate,
+                            )
+                            if da3_masks is not None:
+                                boundary_canvas = da3_masks["boundary"].reshape(B_sz, HW, 1)
+                            else:
+                                boundary_canvas = _rotation_unseen_boundary_mask(
+                                    predictor_ref,
+                                    local_states_canon,
+                                    local_intrinsics_window,
+                                    HW,
+                                    h_context_step.dtype,
+                                    intermediate_unseen_boundary_band,
+                                )
+                        else:
+                            boundary_canvas = _rotation_unseen_boundary_mask(
+                                predictor_ref,
+                                local_states_canon,
+                                local_intrinsics_window,
+                                HW,
+                                h_context_step.dtype,
+                                intermediate_unseen_boundary_band,
+                            )
+                        # LM5c: rotation-gated beta — scale beta_valid per sample
+                        # by how rotation-dominant the incoming action is.
+                        canvas_rot_weight = None
+                        if canvas_warp_mode == "rot_gated":
+                            canvas_rot_weight = _canvas_rot_weight(
+                                local_actions_window,
+                                dtype=h_context_step.dtype,
+                            ).to(device=h_context_step.device)
                         future_tokens = predictor_ref.prepare_canvas_slot(
                             warped_context_raw=canvas_inputs["warped_context_raw"],
                             valid_mask=canvas_inputs["valid_mask"],
@@ -2832,6 +3104,7 @@ def main(args, resume_preempt=False):
                             boundary_mask=boundary_canvas,
                             confidence_mask=canvas_inputs["confidence_mask"],
                             rollout_step=rollout_step,
+                            rot_weight=canvas_rot_weight,
                         )
                     else:
                         future_tokens = predictor_ref.future_mask_token.to(
@@ -2993,6 +3266,9 @@ def main(args, resume_preempt=False):
                     corrector_layer_stats = None  # captured at rollout_step=0 only
                     completion_losses = []
                     completion_region_stats = []
+                    patchgan_generator_losses = []
+                    patchgan_discriminator_losses = []
+                    patchgan_diag_stats = []
                     warp_diag_stats = []    # P0.6: depth_std per rollout step
                     layer_loss_stats = []  # P0.5: per-layer L1 per rollout step
                     # Phase R: K=1 cycle loss + drift_from_prev diagnostic
@@ -3103,6 +3379,47 @@ def main(args, resume_preempt=False):
                                 if rot_mask is not None:
                                     boundary = rot_mask.to(device=preds_next.device, dtype=preds_next.dtype).clamp(0.0, 1.0)
                                     completion_masks = {
+                                        "visible": 1.0 - boundary,
+                                        "boundary": boundary,
+                                        "disoccluded": torch.zeros_like(boundary),
+                                    }
+
+                        patchgan_masks = None
+                        if latent_patchgan_enabled:
+                            if (
+                                completion_masks is not None
+                                and completion_enabled
+                                and completion_mask_source == latent_patchgan_mask_source
+                            ):
+                                patchgan_masks = completion_masks
+                            elif latent_patchgan_mask_source == "da3" and completion_depths is not None:
+                                src_idx = max(0, target_tubelet_idx - 1)
+                                patchgan_masks = _depth_visibility_region_masks(
+                                    predictor_ref,
+                                    local_states_step,
+                                    local_intrinsics_step,
+                                    completion_depths[:, src_idx],
+                                    completion_depths[:, target_tubelet_idx],
+                                    HW,
+                                    preds_next.dtype,
+                                    completion_depth_tau,
+                                    completion_boundary_dilate,
+                                )
+                            elif latent_patchgan_mask_source == "rotation":
+                                rot_mask = _rotation_unseen_boundary_mask(
+                                    predictor_ref,
+                                    local_states_step,
+                                    local_intrinsics_step,
+                                    HW,
+                                    preds_next.dtype,
+                                    intermediate_unseen_boundary_band,
+                                )
+                                if rot_mask is not None:
+                                    boundary = rot_mask.to(
+                                        device=preds_next.device,
+                                        dtype=preds_next.dtype,
+                                    ).clamp(0.0, 1.0)
+                                    patchgan_masks = {
                                         "visible": 1.0 - boundary,
                                         "boundary": boundary,
                                         "disoccluded": torch.zeros_like(boundary),
@@ -3232,6 +3549,96 @@ def main(args, resume_preempt=False):
                                 unseen_boundary_mask=unseen_boundary_mask,
                             )
                         )
+                        if (
+                            latent_patchgan_enabled
+                            and latent_patchgan is not None
+                            and patchgan_masks is not None
+                        ):
+                            _reveal_mask = patchgan_masks["disoccluded"].to(
+                                device=pred_final.device,
+                                dtype=pred_final.dtype,
+                            ).reshape(pred_final.shape[0], -1, 1)
+                            _reveal_count_local = _reveal_mask.sum().detach()
+                            _reveal_count_global = _reveal_count_local
+                            if dist.is_available() and dist.is_initialized():
+                                _reveal_count_global = _reveal_count_local.clone()
+                                dist.all_reduce(_reveal_count_global, op=dist.ReduceOp.SUM)
+                            _has_reveal_global = bool(_reveal_count_global.item() > 0.0)
+                            _grid_size = (
+                                int(getattr(predictor_ref, "grid_height", crop_size // patch_size)),
+                                int(getattr(predictor_ref, "grid_width", crop_size // patch_size)),
+                            )
+                            if _latent_patchgan_weight_now > 0.0 and _has_reveal_global:
+                                _patchgan_scorer = (
+                                    latent_patchgan.module
+                                    if hasattr(latent_patchgan, "module")
+                                    else latent_patchgan
+                                )
+                                _set_module_requires_grad(_patchgan_scorer, False)
+                                _patchgan_was_training = _patchgan_scorer.training
+                                _patchgan_scorer.eval()
+                                _fake_logits_g = _patchgan_scorer(pred_final, grid_size=_grid_size)
+                                if _patchgan_was_training:
+                                    _patchgan_scorer.train()
+                                patchgan_generator_losses.append(
+                                    latent_patchgan_hinge_generator_loss(
+                                        _fake_logits_g,
+                                        _reveal_mask,
+                                    )
+                                )
+                            if (
+                                latent_patchgan_train_discriminator
+                                and latent_patchgan_discriminator_weight > 0.0
+                                and epoch >= latent_patchgan_start_epoch
+                                and _has_reveal_global
+                            ):
+                                _set_module_requires_grad(latent_patchgan, True)
+                                _real_logits_d = latent_patchgan(
+                                    h_tgt_this.detach(),
+                                    grid_size=_grid_size,
+                                )
+                                _fake_logits_d = latent_patchgan(
+                                    pred_final.detach(),
+                                    grid_size=_grid_size,
+                                )
+                                patchgan_discriminator_losses.append(
+                                    latent_patchgan_discriminator_weight
+                                    * latent_patchgan_hinge_discriminator_loss(
+                                        _real_logits_d,
+                                        _fake_logits_d,
+                                        _reveal_mask,
+                                    )
+                                )
+                            with torch.no_grad():
+                                _M_pg = _reveal_mask.squeeze(-1)
+                                _den_pg_raw = _M_pg.sum()
+                                _has_reveal_local = bool(_den_pg_raw.item() > 0.0)
+                                _den_pg = _den_pg_raw.clamp_min(1.0e-6)
+                                _pred_norm_tok = pred_final.detach().norm(dim=-1)
+                                _tgt_norm_tok = h_tgt_this.detach().norm(dim=-1)
+                                _pred_norm = (_pred_norm_tok * _M_pg).sum().div(_den_pg)
+                                _tgt_norm = (_tgt_norm_tok * _M_pg).sum().div(_den_pg)
+                                patchgan_diag_stats.append(
+                                    {
+                                        "reveal_frac": float(_M_pg.mean().item()),
+                                        "reveal_active": float(_has_reveal_local),
+                                        "pred_norm": (
+                                            float(_pred_norm.item())
+                                            if _has_reveal_local
+                                            else None
+                                        ),
+                                        "tgt_norm": (
+                                            float(_tgt_norm.item())
+                                            if _has_reveal_local
+                                            else None
+                                        ),
+                                        "norm_ratio": (
+                                            float((_pred_norm / _tgt_norm.clamp_min(1.0e-6)).item())
+                                            if _has_reveal_local
+                                            else None
+                                        ),
+                                    }
+                                )
                         if (
                             completion_enabled
                             and use_completion_head
@@ -3858,6 +4265,45 @@ def main(args, resume_preempt=False):
                                 for key in ("visible", "boundary", "disoccluded")
                             }
 
+                    loss_patchgan_g = loss.new_zeros(())
+                    loss_patchgan_d = loss.new_zeros(())
+                    patchgan_diag_means = None
+                    if patchgan_generator_losses:
+                        loss_patchgan_g = (
+                            sum(patchgan_generator_losses)
+                            / len(patchgan_generator_losses)
+                        )
+                        loss = loss + _latent_patchgan_weight_now * loss_patchgan_g
+                    if patchgan_discriminator_losses:
+                        loss_patchgan_d = (
+                            sum(patchgan_discriminator_losses)
+                            / len(patchgan_discriminator_losses)
+                        )
+                    if patchgan_diag_stats:
+                        _patchgan_norm_stats = [
+                            s for s in patchgan_diag_stats
+                            if s["pred_norm"] is not None
+                        ]
+                        patchgan_diag_means = {
+                            "reveal_frac": float(np.mean([s["reveal_frac"] for s in patchgan_diag_stats])),
+                            "reveal_active": float(np.mean([s["reveal_active"] for s in patchgan_diag_stats])),
+                            "pred_norm": (
+                                float(np.mean([s["pred_norm"] for s in _patchgan_norm_stats]))
+                                if _patchgan_norm_stats
+                                else None
+                            ),
+                            "tgt_norm": (
+                                float(np.mean([s["tgt_norm"] for s in _patchgan_norm_stats]))
+                                if _patchgan_norm_stats
+                                else None
+                            ),
+                            "norm_ratio": (
+                                float(np.mean([s["norm_ratio"] for s in _patchgan_norm_stats]))
+                                if _patchgan_norm_stats
+                                else None
+                            ),
+                        }
+
                     # P0.5/P0.6: aggregate per-layer and depth diagnostics.
                     warp_diag_means = None
                     layer_loss_means = None
@@ -3914,10 +4360,26 @@ def main(args, resume_preempt=False):
                     loss.backward()
                 if mixed_precision:
                     scaler.step(optimizer)
-                    scaler.update()
                 else:
                     optimizer.step()
                 optimizer.zero_grad()
+                if latent_patchgan_optimizer is not None:
+                    # Keep the discriminator update separate from the
+                    # predictor update: D sees detached real/fake latents,
+                    # while the generator loss only used D as a frozen scoring
+                    # function.
+                    latent_patchgan_optimizer.zero_grad(set_to_none=True)
+                    if patchgan_discriminator_losses:
+                        if mixed_precision:
+                            scaler.scale(loss_patchgan_d).backward()
+                            scaler.unscale_(latent_patchgan_optimizer)
+                            scaler.step(latent_patchgan_optimizer)
+                        else:
+                            loss_patchgan_d.backward()
+                            latent_patchgan_optimizer.step()
+                    latent_patchgan_optimizer.zero_grad(set_to_none=True)
+                if mixed_precision:
+                    scaler.update()
 
                 _cycle_loss_value = (
                     float(loss_cycle.item())
@@ -3934,6 +4396,18 @@ def main(args, resume_preempt=False):
                     float(loss_completion.item())
                     if isinstance(loss_completion, torch.Tensor)
                     and loss_completion.numel() > 0
+                    else 0.0
+                )
+                _patchgan_g_value = (
+                    float(loss_patchgan_g.item())
+                    if isinstance(loss_patchgan_g, torch.Tensor)
+                    and loss_patchgan_g.numel() > 0
+                    else 0.0
+                )
+                _patchgan_d_value = (
+                    float(loss_patchgan_d.item())
+                    if isinstance(loss_patchgan_d, torch.Tensor)
+                    and loss_patchgan_d.numel() > 0
                     else 0.0
                 )
                 _drift_value = (
@@ -3956,6 +4430,9 @@ def main(args, resume_preempt=False):
                     _composition_loss_value,
                     _drift_value,
                     _completion_loss_value,
+                    _patchgan_g_value,
+                    _patchgan_d_value,
+                    patchgan_diag_means,
                     completion_region_means,
                     warp_diag_means,
                     layer_loss_means,
@@ -3965,7 +4442,8 @@ def main(args, resume_preempt=False):
                 loss, loss_pred, loss_ctx, loss_step1, loss_step2, _new_lr, _new_wd,
                 _loss_corr_step, _loss_corr_denoise, _corr_layer_stats,
                 _loss_cycle, _loss_composition, _drift_from_prev,
-                _loss_completion, _completion_region_means,
+                _loss_completion, _loss_patchgan_g, _loss_patchgan_d,
+                _patchgan_diag_means, _completion_region_means,
                 _warp_diag_means, _layer_loss_means,
             ), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
@@ -3993,6 +4471,17 @@ def main(args, resume_preempt=False):
                 drift_from_prev_meter.update(_drift_from_prev)
             if completion_enabled and _loss_completion > 0.0:
                 loss_completion_meter.update(_loss_completion)
+            if latent_patchgan_enabled:
+                if _loss_patchgan_g != 0.0:
+                    patchgan_g_meter.update(_loss_patchgan_g)
+                if _loss_patchgan_d != 0.0:
+                    patchgan_d_meter.update(_loss_patchgan_d)
+                if _patchgan_diag_means is not None:
+                    patchgan_reveal_frac_meter.update(_patchgan_diag_means["reveal_frac"])
+                    if _patchgan_diag_means["pred_norm"] is not None:
+                        patchgan_pred_norm_meter.update(_patchgan_diag_means["pred_norm"])
+                        patchgan_tgt_norm_meter.update(_patchgan_diag_means["tgt_norm"])
+                        patchgan_norm_ratio_meter.update(_patchgan_diag_means["norm_ratio"])
             if _completion_region_means is not None:
                 completion_visible_meter.update(_completion_region_means["visible"])
                 completion_boundary_meter.update(_completion_region_means["boundary"])
@@ -4044,6 +4533,20 @@ def main(args, resume_preempt=False):
                                 completion_visible_meter.avg,
                                 completion_boundary_meter.avg,
                                 completion_disoccluded_meter.avg,
+                            )
+                        )
+                    _patchgan_log = ""
+                    if latent_patchgan_enabled and patchgan_reveal_frac_meter.count > 0:
+                        _patchgan_log = (
+                            " [patchgan g/d: %.4f/%.4f w: %.4f reveal: %.3f norm p/t/r: %.3f/%.3f/%.3f]"
+                            % (
+                                patchgan_g_meter.avg,
+                                patchgan_d_meter.avg,
+                                _latent_patchgan_weight_now,
+                                patchgan_reveal_frac_meter.avg,
+                                patchgan_pred_norm_meter.avg,
+                                patchgan_tgt_norm_meter.avg,
+                                patchgan_norm_ratio_meter.avg,
                             )
                         )
                     _birth_log = ""
@@ -4123,7 +4626,7 @@ def main(args, resume_preempt=False):
                             " ".join(_ucpe_grad_norms),
                         )
                     logger.info(
-                        "[%d, %5d] loss: %.3f [pred: %.3f ctx: %.3f step1: %.3f step2: %.3f]%s%s%s%s%s "
+                        "[%d, %5d] loss: %.3f [pred: %.3f ctx: %.3f step1: %.3f step2: %.3f]%s%s%s%s%s%s "
                         "[wd: %.2e] [lr: %.2e] "
                         "[mem: %.2e] "
                         "[iter: %.1f ms] [gpu: %.1f ms] [data: %.1f ms]"
@@ -4134,6 +4637,7 @@ def main(args, resume_preempt=False):
                             _corr_log,
                             _cycle_log,
                             _completion_log,
+                            _patchgan_log,
                             _birth_log,
                             _diag_log,
                             _new_wd, _new_lr,
@@ -4170,6 +4674,14 @@ def main(args, resume_preempt=False):
             training_stats["completion_visible_frac"].append(completion_visible_meter.avg)
             training_stats["completion_boundary_frac"].append(completion_boundary_meter.avg)
             training_stats["completion_disoccluded_frac"].append(completion_disoccluded_meter.avg)
+        if latent_patchgan_enabled:
+            training_stats["patchgan_g"].append(patchgan_g_meter.avg)
+            training_stats["patchgan_d"].append(patchgan_d_meter.avg)
+            training_stats["patchgan_weight"].append(_latent_patchgan_weight_now)
+            training_stats["patchgan_reveal_frac"].append(patchgan_reveal_frac_meter.avg)
+            training_stats["patchgan_pred_norm"].append(patchgan_pred_norm_meter.avg)
+            training_stats["patchgan_tgt_norm"].append(patchgan_tgt_norm_meter.avg)
+            training_stats["patchgan_norm_ratio"].append(patchgan_norm_ratio_meter.avg)
         if target_slot_mode == "canvas_first":
             training_stats["canvas_valid_frac"].append(canvas_valid_meter.avg)
             training_stats["canvas_oov_frac"].append(canvas_oov_meter.avg)

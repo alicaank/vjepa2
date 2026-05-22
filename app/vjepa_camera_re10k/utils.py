@@ -118,6 +118,43 @@ def _lookup_state_dict_tensor(state_dict, key):
     return None, None
 
 
+def _normalize_state_dict_module_prefix(pretrained_dict, model):
+    """Match a checkpoint state-dict's DDP ``module.`` prefix to ``model``.
+
+    ``load_state_dict(..., strict=False)`` is dangerously quiet when every key
+    misses due only to DDP wrapping. Normalize the whole checkpoint prefix before
+    shape adaptation so frozen unwrapped encoders and DDP-wrapped target
+    encoders both receive the same pretrained weights.
+    """
+    if not pretrained_dict or model is None:
+        return pretrained_dict
+    live_keys = set(model.state_dict().keys())
+    if not live_keys:
+        return pretrained_dict
+    ckpt_keys = list(pretrained_dict.keys())
+    ckpt_is_wrapped = all(k.startswith("module.") for k in ckpt_keys)
+    live_is_wrapped = any(k.startswith("module.") for k in live_keys)
+    if ckpt_is_wrapped and not live_is_wrapped:
+        return {k[len("module."):]: v for k, v in pretrained_dict.items()}
+    if live_is_wrapped and not ckpt_is_wrapped:
+        return {f"module.{k}": v for k, v in pretrained_dict.items()}
+    return pretrained_dict
+
+
+def _raise_if_zero_key_load(load_msg, model, *, module_name, loader_name):
+    live_keys = set(model.state_dict().keys()) if model is not None else set()
+    n_expected = len(live_keys)
+    n_missing = len(getattr(load_msg, "missing_keys", []) or [])
+    if n_expected > 0 and n_missing >= n_expected:
+        raise RuntimeError(
+            f"{loader_name}: {module_name} matched 0 keys "
+            f"(missing={n_missing}/{n_expected}). Checkpoint keys likely "
+            "have a different prefix (for example DDP ``module.``) than the "
+            "live model. Aborting so training/eval does not run with a "
+            "randomly initialized module."
+        )
+
+
 def _upgrade_camera_encoder_state_dict(pretrained_dict, model):
     """Adapt V-JEPA 2.1 encoder weights for the CameraAC image-path setup.
 
@@ -196,23 +233,44 @@ def load_pretrained(
     if load_encoder:
         pretrained_dict = checkpoint[context_encoder_key]
         pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        pretrained_dict = _normalize_state_dict_module_prefix(pretrained_dict, encoder)
         pretrained_dict = _upgrade_camera_encoder_state_dict(pretrained_dict, encoder)
         msg = encoder.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
+        _raise_if_zero_key_load(
+            msg,
+            encoder,
+            module_name="encoder",
+            loader_name="load_pretrained",
+        )
 
     if load_predictor:
         pretrained_dict = checkpoint["predictor"]
         pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        pretrained_dict = _normalize_state_dict_module_prefix(pretrained_dict, predictor)
         pretrained_dict = _upgrade_camera_predictor_state_dict(pretrained_dict, predictor)
         msg = predictor.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
+        _raise_if_zero_key_load(
+            msg,
+            predictor,
+            module_name="predictor",
+            loader_name="load_pretrained",
+        )
 
     if load_encoder and target_encoder is not None:
         pretrained_dict = checkpoint[target_encoder_key]
         pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        pretrained_dict = _normalize_state_dict_module_prefix(pretrained_dict, target_encoder)
         pretrained_dict = _upgrade_camera_encoder_state_dict(pretrained_dict, target_encoder)
         msg = target_encoder.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}")
+        _raise_if_zero_key_load(
+            msg,
+            target_encoder,
+            module_name="target_encoder",
+            loader_name="load_pretrained",
+        )
 
     del checkpoint
     return encoder, predictor, target_encoder
@@ -226,6 +284,8 @@ def load_checkpoint(
     opt=None,
     scaler=None,
     corrector=None,
+    latent_patchgan=None,
+    latent_patchgan_opt=None,
     replace_kw=["backbone."],
 ):
     logger.info(f"Loading checkpoint from {r_path}")
@@ -250,6 +310,14 @@ def load_checkpoint(
                 "Resume checkpoint has no 'corrector' key; corrector retains "
                 "its initialization (residual_scale_init~=0, near no-op)."
             )
+    if latent_patchgan is not None:
+        if "latent_patchgan" in checkpoint:
+            model_key_pairs.append(("latent_patchgan", latent_patchgan))
+        else:
+            logger.warning(
+                "Resume checkpoint has no 'latent_patchgan' key; discriminator "
+                "retains its initialization."
+            )
 
     for key, model in model_key_pairs:
         if model is None:
@@ -260,21 +328,8 @@ def load_checkpoint(
         pretrained_dict = checkpoint[key]
         for kw in replace_kw:
             pretrained_dict = {k.replace(kw, ""): v for k, v in pretrained_dict.items()}
-        # Strip DDP ``module.`` prefix when the live model is not DDP-wrapped.
-        # DDP-wrapped training (e.g. 2×H100) saves ``encoder.state_dict()``
-        # with keys like ``module.blocks.0...`` whereas subprocess evaluation
-        # paths build an unwrapped model. Without this strip, ``load_state_dict``
-        # silently matches zero keys (strict=False) and leaves the predictor at
-        # random init / encoder at pretrained, producing degenerate rollout
-        # evals that look identical across every experiment.
         live_keys = set(model.state_dict().keys())
-        if pretrained_dict:
-            ckpt_is_wrapped = all(k.startswith("module.") for k in pretrained_dict.keys())
-            live_is_wrapped = any(k.startswith("module.") for k in live_keys)
-            if ckpt_is_wrapped and not live_is_wrapped:
-                pretrained_dict = {k[len("module."):]: v for k, v in pretrained_dict.items()}
-            elif live_is_wrapped and not ckpt_is_wrapped:
-                pretrained_dict = {f"module.{k}": v for k, v in pretrained_dict.items()}
+        pretrained_dict = _normalize_state_dict_module_prefix(pretrained_dict, model)
         if key in ("encoder", "target_encoder"):
             pretrained_dict = _upgrade_camera_encoder_state_dict(pretrained_dict, model)
         if key == "predictor":
@@ -283,16 +338,12 @@ def load_checkpoint(
         logger.info(f"loaded {key} from epoch {epoch} with msg: {msg}")
         # Fail loud when a non-trivial load matched zero keys — this almost
         # always means a prefix / naming mismatch silently zeroed the model.
-        n_missing = len(getattr(msg, "missing_keys", []) or [])
-        n_expected = len(live_keys)
-        if n_expected > 0 and n_missing >= n_expected:
-            raise RuntimeError(
-                f"load_checkpoint: {key} matched 0 keys "
-                f"(missing={n_missing}/{n_expected}). Checkpoint keys likely "
-                "have a different prefix (e.g. DDP ``module.``) than the "
-                "live model. Aborting so rollout/eval metrics are not run "
-                "on an untrained model."
-            )
+        _raise_if_zero_key_load(
+            msg,
+            model,
+            module_name=key,
+            loader_name="load_checkpoint",
+        )
         # Fail loud when the live predictor is missing experiment-flag submodules
         # present in the checkpoint. Silent drops invalidate ablation metrics.
         if key == "predictor":
@@ -338,6 +389,21 @@ def load_checkpoint(
             scaler.load_state_dict(scaler_state)
         else:
             logger.warning("Checkpoint has no scaler state; resuming from weights-only checkpoint.")
+    if latent_patchgan_opt is not None:
+        patchgan_opt_state = checkpoint.get("latent_patchgan_opt")
+        if patchgan_opt_state is not None:
+            try:
+                latent_patchgan_opt.load_state_dict(patchgan_opt_state)
+            except ValueError as e:
+                logger.warning(
+                    "Skipping latent PatchGAN optimizer state load because it "
+                    f"is incompatible with the live discriminator: {e}"
+                )
+        else:
+            logger.warning(
+                "Checkpoint has no latent_patchgan_opt state; discriminator "
+                "optimizer starts fresh."
+            )
 
     logger.info(f"read-path: {r_path}")
     del checkpoint
@@ -468,16 +534,15 @@ def init_video_model(
     encoder_freeze=False,
 ):
     # Encoder backbone selection. ``vjepa21`` (default) preserves the
-    # canonical V-JEPA 2.1 ViT-L behaviour bit-for-bit. ``mast3r`` swaps
-    # in the pretrained MASt3R encoder via ``MASt3REncoderAdapter``; the
-    # token grid (24x24x1024) and num_heads (16) match V-JEPA 2.1
-    # exactly so the predictor side is unchanged.
+    # canonical V-JEPA 2.1 behaviour bit-for-bit. ``mast3r`` and
+    # ``cradio`` swap in frozen feature adapters with the same forward
+    # contract (list of ``(B, N, D)`` feature tensors).
     encoder_backbone = os.environ.get("ENCODER_BACKBONE", encoder_backbone) or "vjepa21"
     encoder_backbone = str(encoder_backbone).lower().strip()
-    if encoder_backbone not in ("vjepa21", "mast3r"):
+    if encoder_backbone not in ("vjepa21", "mast3r", "cradio"):
         raise ValueError(
             f"encoder_backbone={encoder_backbone!r} unsupported. "
-            f"Expected 'vjepa21' or 'mast3r'."
+            f"Expected 'vjepa21', 'mast3r', or 'cradio'."
         )
     if os.environ.get("ENCODER_FREEZE") is not None:
         encoder_freeze = _env_bool("ENCODER_FREEZE", encoder_freeze)
@@ -605,8 +670,8 @@ def init_video_model(
     # the canonical ``hierarchical_layers`` taps. Bit-identical to all
     # prior runs.
     #
-    # ``mast3r``: build a MASt3REncoderAdapter at the same crop_size and
-    # patch_size. The adapter exposes V-JEPA-compatible attributes
+    # Adapter backbones: build a frozen feature adapter at the same
+    # crop_size and patch_size. The adapter exposes V-JEPA-compatible attributes
     # (``embed_dim``, ``num_heads``, ``hierarchical_layers``,
     # ``out_layers``, ``img_temporal_dim_size=1``) and a forward that
     # returns the same per-tap list shape, so the predictor side is
@@ -614,19 +679,33 @@ def init_video_model(
     # the shell driver / Azure YAML to ``True`` for the MASt3R pilot
     # (matching the user-selected ``enc_lr_scale=0.0`` protocol).
     # ------------------------------------------------------------------
-    if encoder_backbone == "mast3r":
-        from app.vjepa_camera_re10k.mast3r_encoder import MASt3REncoderAdapter
+    if encoder_backbone in ("mast3r", "cradio"):
+        if encoder_backbone == "mast3r":
+            from app.vjepa_camera_re10k.mast3r_encoder import MASt3REncoderAdapter
 
-        encoder = MASt3REncoderAdapter(
-            img_size=crop_size,
-            patch_size=patch_size,
-            freeze=encoder_freeze,
-        )
+            encoder = MASt3REncoderAdapter(
+                img_size=crop_size,
+                patch_size=patch_size,
+                freeze=encoder_freeze,
+            )
+        else:
+            from app.vjepa_camera_re10k.cradio_encoder import CRADIOEncoderAdapter
+
+            _cradio_embed_dim = os.environ.get("CRADIO_EMBED_DIM", "").strip()
+            encoder = CRADIOEncoderAdapter(
+                model_version=os.environ.get("CRADIO_MODEL_VERSION", "c-radio_v4-h"),
+                img_size=crop_size,
+                patch_size=patch_size,
+                embed_dim=int(_cradio_embed_dim) if _cradio_embed_dim else None,
+                freeze=encoder_freeze,
+                force_reload=_env_bool("CRADIO_FORCE_RELOAD", False),
+                skip_validation=_env_bool("CRADIO_SKIP_VALIDATION", True),
+            )
         # Validate the predictor's per-layer head split is consistent
         # with the adapter's chosen taps.
         if n_hierarchical_layers != len(encoder.hierarchical_layers):
             raise ValueError(
-                f"n_hierarchical_layers={n_hierarchical_layers} but the MASt3R "
+                f"n_hierarchical_layers={n_hierarchical_layers} but the {encoder_backbone} "
                 f"adapter has hierarchical_layers={encoder.hierarchical_layers} "
                 f"(len={len(encoder.hierarchical_layers)}). They must match "
                 f"because the predictor splits target features by this count."
@@ -713,7 +792,7 @@ def init_video_model(
         n_enc_total = sum(p.numel() for p in encoder.parameters())
         n_enc_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
         logger.info(
-            f"Encoder (MASt3R): total={n_enc_total:,}  trainable={n_enc_trainable:,}"
+            f"Encoder ({encoder_backbone}): total={n_enc_total:,}  trainable={n_enc_trainable:,}"
         )
         logger.info(f"Predictor number of parameters: {sum(p.numel() for p in predictor.parameters() if p.requires_grad):,}")
 
