@@ -360,6 +360,8 @@ def load_checkpoint(
                 "canvas_type_embed.",
                 "canvas_target_step_embed.",
                 "camera_ucpe_branches.",
+                "predictor_adaln_conditioner.",
+                "predictor_adaln_modulators.",
             )
             leaked = [k for k in unexpected if any(k.startswith(p) for p in flag_prefixes)]
             if leaked:
@@ -490,6 +492,7 @@ def init_video_model(
     ray_pe_mode="origin_dir",
     ray_visibility_features="none",
     pose_conditioning_mode="token+raymap",
+    action_token_mode="transition",
     use_delta_head=False,
     use_residual_head=False,
     residual_head_depth=2,
@@ -530,6 +533,19 @@ def init_video_model(
     camera_ucpe_enabled=False,
     camera_ucpe_apply_layers=(0, 3, 6, 9),
     camera_ucpe_gamma_init=0.0,
+    predictor_adaln_enabled=False,
+    predictor_adaln_hidden=512,
+    coord_qk_enabled=False,
+    coord_qk_apply_layers=(0, 3, 6, 9),
+    coord_qk_hidden=256,
+    coord_qk_freqs=6,
+    coord_qk_gamma_init=0.1,
+    ray_qk_enabled=False,
+    ray_qk_apply_layers=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
+    ray_qk_gamma_init=0.5,
+    target_motion_query_enabled=False,
+    target_motion_query_hidden=128,
+    target_motion_query_gamma_init=0.1,
     encoder_backbone="vjepa21",
     encoder_freeze=False,
 ):
@@ -568,6 +584,9 @@ def init_video_model(
     pose_conditioning_mode = os.environ.get(
         "POSE_CONDITIONING_MODE", pose_conditioning_mode
     ) or "token+raymap"
+    action_token_mode = os.environ.get(
+        "ACTION_TOKEN_MODE", action_token_mode
+    ) or "transition"
     # RayMap v4c (2026-05-01): ray_visibility_features adds a rotation-only
     # warp correspondence block (uv_warp, valid, border) to plucker_pair.
     # Only valid with ray_pe_mode='plucker_pair'. See history doc §4.6.
@@ -639,12 +658,29 @@ def init_video_model(
     camera_ucpe_layers_env = _env_int_list("CAMERA_UCPE_APPLY_LAYERS")
     if camera_ucpe_layers_env is not None:
         camera_ucpe_apply_layers = tuple(camera_ucpe_layers_env)
+    predictor_adaln_enabled = bool(predictor_adaln_enabled) or _env_bool("PREDICTOR_ADALN_ENABLED", False)
+    predictor_adaln_hidden = _env_int("PREDICTOR_ADALN_HIDDEN", predictor_adaln_hidden)
+    coord_qk_enabled = bool(coord_qk_enabled) or _env_bool("COORD_QK_ENABLED", False)
+    coord_qk_hidden = _env_int("COORD_QK_HIDDEN", coord_qk_hidden)
+    coord_qk_freqs = _env_int("COORD_QK_FREQS", coord_qk_freqs)
+    coord_qk_gamma_init = _env_float("COORD_QK_GAMMA_INIT", coord_qk_gamma_init)
+    coord_qk_layers_env = _env_int_list("COORD_QK_APPLY_LAYERS")
+    if coord_qk_layers_env is not None:
+        coord_qk_apply_layers = tuple(coord_qk_layers_env)
+    ray_qk_enabled = bool(ray_qk_enabled) or _env_bool("RAY_QK_ENABLED", False)
+    ray_qk_gamma_init = _env_float("RAY_QK_GAMMA_INIT", ray_qk_gamma_init)
+    ray_qk_layers_env = _env_int_list("RAY_QK_APPLY_LAYERS")
+    if ray_qk_layers_env is not None:
+        ray_qk_apply_layers = tuple(ray_qk_layers_env)
+    target_motion_query_enabled = bool(target_motion_query_enabled) or _env_bool("TARGET_MOTION_QUERY_ENABLED", False)
+    target_motion_query_hidden = _env_int("TARGET_MOTION_QUERY_HIDDEN", target_motion_query_hidden)
+    target_motion_query_gamma_init = _env_float("TARGET_MOTION_QUERY_GAMMA_INIT", target_motion_query_gamma_init)
     logger.info(
         "init_video_model experiment flags: "
         f"encoder_backbone={encoder_backbone} (freeze={encoder_freeze}) "
         f"use_ray_pe={use_ray_pe} (mode={ray_pe_mode}, dim={ray_pe_dim}, hidden={ray_pe_hidden}, "
         f"visibility_features={ray_visibility_features}) "
-        f"pose_conditioning_mode={pose_conditioning_mode} "
+        f"pose_conditioning_mode={pose_conditioning_mode} action_token_mode={action_token_mode} "
         f"use_delta_head={use_delta_head} "
         f"use_residual_head={use_residual_head} (depth={residual_head_depth}, ratio={residual_head_ratio}) "
         f"use_completion_head={use_completion_head} (depth={completion_head_depth}, ratio={completion_head_ratio}, "
@@ -660,7 +696,16 @@ def init_video_model(
         f"lambda_init={correspondence_bias_lambda_init}, learnable={correspondence_bias_learnable}, "
         f"apply_layers={tuple(correspondence_bias_apply_layers)}) "
         f"camera_ucpe_enabled={camera_ucpe_enabled} "
-        f"(apply_layers={tuple(camera_ucpe_apply_layers)}, gamma_init={camera_ucpe_gamma_init})"
+        f"(apply_layers={tuple(camera_ucpe_apply_layers)}, gamma_init={camera_ucpe_gamma_init}) "
+        f"predictor_adaln_enabled={predictor_adaln_enabled} "
+        f"(hidden={predictor_adaln_hidden}) "
+        f"coord_qk_enabled={coord_qk_enabled} "
+        f"(apply_layers={tuple(coord_qk_apply_layers)}, hidden={coord_qk_hidden}, "
+        f"freqs={coord_qk_freqs}, gamma_init={coord_qk_gamma_init}) "
+        f"ray_qk_enabled={ray_qk_enabled} "
+        f"(apply_layers={tuple(ray_qk_apply_layers)}, gamma_init={ray_qk_gamma_init}) "
+        f"target_motion_query_enabled={target_motion_query_enabled} "
+        f"(hidden={target_motion_query_hidden}, gamma_init={target_motion_query_gamma_init})"
     )
 
     # ------------------------------------------------------------------
@@ -741,6 +786,7 @@ def init_video_model(
             ray_pe_mode=ray_pe_mode,
             ray_visibility_features=ray_visibility_features,
             pose_conditioning_mode=pose_conditioning_mode,
+            action_token_mode=action_token_mode,
             use_delta_head=use_delta_head,
             use_residual_head=use_residual_head,
             residual_head_depth=residual_head_depth,
@@ -781,6 +827,19 @@ def init_video_model(
             camera_ucpe_enabled=camera_ucpe_enabled,
             camera_ucpe_apply_layers=tuple(camera_ucpe_apply_layers),
             camera_ucpe_gamma_init=camera_ucpe_gamma_init,
+            predictor_adaln_enabled=predictor_adaln_enabled,
+            predictor_adaln_hidden=predictor_adaln_hidden,
+            coord_qk_enabled=coord_qk_enabled,
+            coord_qk_apply_layers=tuple(coord_qk_apply_layers),
+            coord_qk_hidden=coord_qk_hidden,
+            coord_qk_freqs=coord_qk_freqs,
+            coord_qk_gamma_init=coord_qk_gamma_init,
+            ray_qk_enabled=ray_qk_enabled,
+            ray_qk_apply_layers=tuple(ray_qk_apply_layers),
+            ray_qk_gamma_init=ray_qk_gamma_init,
+            target_motion_query_enabled=target_motion_query_enabled,
+            target_motion_query_hidden=target_motion_query_hidden,
+            target_motion_query_gamma_init=target_motion_query_gamma_init,
         )
 
         encoder.to(device)
@@ -899,6 +958,7 @@ def init_video_model(
         ray_pe_mode=ray_pe_mode,
         ray_visibility_features=ray_visibility_features,
         pose_conditioning_mode=pose_conditioning_mode,
+        action_token_mode=action_token_mode,
         use_delta_head=use_delta_head,
         use_residual_head=use_residual_head,
         residual_head_depth=residual_head_depth,
@@ -939,6 +999,19 @@ def init_video_model(
         camera_ucpe_enabled=camera_ucpe_enabled,
         camera_ucpe_apply_layers=tuple(camera_ucpe_apply_layers),
         camera_ucpe_gamma_init=camera_ucpe_gamma_init,
+        predictor_adaln_enabled=predictor_adaln_enabled,
+        predictor_adaln_hidden=predictor_adaln_hidden,
+        coord_qk_enabled=coord_qk_enabled,
+        coord_qk_apply_layers=tuple(coord_qk_apply_layers),
+        coord_qk_hidden=coord_qk_hidden,
+        coord_qk_freqs=coord_qk_freqs,
+        coord_qk_gamma_init=coord_qk_gamma_init,
+        ray_qk_enabled=ray_qk_enabled,
+        ray_qk_apply_layers=tuple(ray_qk_apply_layers),
+        ray_qk_gamma_init=ray_qk_gamma_init,
+        target_motion_query_enabled=target_motion_query_enabled,
+        target_motion_query_hidden=target_motion_query_hidden,
+        target_motion_query_gamma_init=target_motion_query_gamma_init,
     )
 
     encoder.to(device)

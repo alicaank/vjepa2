@@ -165,7 +165,7 @@ class ACRoPEAttention(nn.Module):
         width_ids = (ids - tokens_per_frame * frame_ids) - tokens_per_row * height_ids
         return 1.0 * frame_ids, 1.0 * height_ids, 1.0 * width_ids
 
-    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0):
+    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0, qk_mod=None):
         B, N, C = x.size()
 
         # -- compute position of each frame token
@@ -245,6 +245,42 @@ class ACRoPEAttention(nn.Module):
             k = merge_(k, action_k)
             v = merge_(v, action_v)
 
+        rayqk_debug_request = getattr(self, "_rayqk_debug_request", None)
+        rayqk_debug_payload = None
+        if qk_mod is not None:
+            qk_mod = qk_mod.reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            if rayqk_debug_request is not None:
+                with torch.no_grad():
+                    rayqk_debug_payload = self._build_rayqk_debug_payload(
+                        q=q,
+                        k=k,
+                        qk_mod=qk_mod,
+                        request=rayqk_debug_request,
+                        B=B,
+                        N=N,
+                        T=T,
+                        H=H,
+                        W=W,
+                        action_tokens=action_tokens,
+                    )
+            q = q + qk_mod
+            k = k + qk_mod
+        elif rayqk_debug_request is not None:
+            with torch.no_grad():
+                rayqk_debug_payload = self._build_rayqk_debug_payload(
+                    q=q,
+                    k=k,
+                    qk_mod=None,
+                    request=rayqk_debug_request,
+                    B=B,
+                    N=N,
+                    T=T,
+                    H=H,
+                    W=W,
+                    action_tokens=action_tokens,
+                )
+        self._last_rayqk_debug_payload = rayqk_debug_payload
+
         if attn_mask is not None or self.use_sdpa:
             with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION, torch.nn.attention.SDPBackend.MATH]):
                 x = F.scaled_dot_product_attention(
@@ -261,6 +297,85 @@ class ACRoPEAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+    def _build_rayqk_debug_payload(
+        self,
+        *,
+        q,
+        k,
+        qk_mod,
+        request,
+        B,
+        N,
+        T,
+        H,
+        W,
+        action_tokens,
+    ):
+        if B <= 0 or T is None or H is None or W is None:
+            return None
+        HW = int(H * W)
+        cond = int(action_tokens or 0)
+        if T <= 1 or HW <= 0:
+            return None
+        target_tokens = request.get("target_tokens") or []
+        target_tokens = [int(t) for t in target_tokens if 0 <= int(t) < HW]
+        if not target_tokens:
+            target_tokens = [HW // 2]
+        context_frames = list(range(int(T) - 1))
+        src_idx = []
+        src_frame_ids = []
+        for frame in context_frames:
+            base = frame * (cond + HW) + cond
+            src_idx.extend(range(base, base + HW))
+            src_frame_ids.extend([frame] * HW)
+        tgt_idx = [(int(T) - 1) * (cond + HW) + cond + tok for tok in target_tokens]
+        if not src_idx or max(src_idx + tgt_idx) >= int(N):
+            return None
+        device = q.device
+        src = torch.as_tensor(src_idx, device=device, dtype=torch.long)
+        tgt = torch.as_tensor(tgt_idx, device=device, dtype=torch.long)
+        q_t = q[0, :, tgt, :].float()
+        k_s = k[0, :, src, :].float()
+        semantic = torch.einsum("htd,hsd->hts", q_t, k_s) * float(self.scale)
+        zero = torch.zeros_like(semantic)
+        if qk_mod is None:
+            rr = zero
+            cross = zero
+            final = semantic
+        else:
+            r_t = qk_mod[0, :, tgt, :].float()
+            r_s = qk_mod[0, :, src, :].float()
+            rr = torch.einsum("htd,hsd->hts", r_t, r_s) * float(self.scale)
+            cross = (
+                torch.einsum("htd,hsd->hts", q_t, r_s)
+                + torch.einsum("htd,hsd->hts", r_t, k_s)
+            ) * float(self.scale)
+            final = semantic + cross + rr
+        # Average over heads for compact visualization. Keep both raw logit
+        # components and context-only attentions; the latter answers "where did
+        # this target token route content from?"
+        semantic_m = semantic.mean(dim=0)
+        rr_m = rr.mean(dim=0)
+        cross_m = cross.mean(dim=0)
+        final_m = final.mean(dim=0)
+        delta_m = final_m - semantic_m
+        semantic_attn = semantic_m.softmax(dim=-1)
+        final_attn = final_m.softmax(dim=-1)
+        return {
+            "block": int(request.get("block", -1)),
+            "target_tokens": list(target_tokens),
+            "context_frames": context_frames,
+            "grid_h": int(H),
+            "grid_w": int(W),
+            "semantic_logits": semantic_m.detach().cpu(),
+            "geometry_logits": rr_m.detach().cpu(),
+            "cross_logits": cross_m.detach().cpu(),
+            "final_logits": final_m.detach().cpu(),
+            "delta_logits": delta_m.detach().cpu(),
+            "semantic_attn": semantic_attn.detach().cpu(),
+            "final_attn": final_attn.detach().cpu(),
+        }
 
 
 class RoPEAttention(nn.Module):
@@ -490,10 +605,19 @@ class ACBlock(nn.Module):
         else:
             self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0):
+    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0, qk_mod=None):
         y = self.norm1(x)
         if isinstance(self.attn, ACRoPEAttention):
-            y = self.attn(y, mask=mask, attn_mask=attn_mask, T=T, H=H, W=W, action_tokens=action_tokens)
+            y = self.attn(
+                y,
+                mask=mask,
+                attn_mask=attn_mask,
+                T=T,
+                H=H,
+                W=W,
+                action_tokens=action_tokens,
+                qk_mod=qk_mod,
+            )
         else:
             y = self.attn(y, mask=mask, attn_mask=attn_mask)
         x = x + self.drop_path(y)

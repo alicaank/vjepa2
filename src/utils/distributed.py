@@ -31,6 +31,9 @@ def init_distributed(port=37129, rank_and_world_size=(None, None)):
     rank, world_size = rank_and_world_size
     os.environ["MASTER_ADDR"] = "localhost"
 
+    if (rank is not None) and (world_size is not None) and int(world_size) <= 1:
+        return 1, int(rank)
+
     if (rank is None) or (world_size is None):
         try:
             world_size = int(os.environ["SLURM_NTASKS"])
@@ -42,6 +45,7 @@ def init_distributed(port=37129, rank_and_world_size=(None, None)):
             return world_size, rank
 
     try:
+        port = int(os.environ.get("MASTER_PORT", port))
         os.environ["MASTER_PORT"] = str(port)
         torch.distributed.init_process_group(backend="nccl", world_size=world_size, rank=rank)
     except Exception as e:

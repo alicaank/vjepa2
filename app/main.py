@@ -11,7 +11,11 @@ from pathlib import Path
 import yaml
 
 from app.scaffold import main as app_main
-from src.utils.distributed import init_distributed
+
+
+def _boot_log(message):
+    print(f"[app.main.bootstrap] {message}", flush=True)
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--fname", type=str, help="name of config file to load", default="configs.yaml")
@@ -35,13 +39,13 @@ parser.add_argument(
 def process_main(rank, fname, world_size, devices):
     import os
 
+    _boot_log(f"process_main start rank={rank} world_size={world_size} fname={fname}")
     os.environ["CUDA_VISIBLE_DEVICES"] = str(devices[rank].split(":")[-1])
 
     import logging
 
-    from src.utils.logging import get_logger
-
-    logger = get_logger(force=True)
+    logging.basicConfig(stream=None, level=logging.INFO, force=True)
+    logger = logging.getLogger()
     if rank == 0:
         logger.setLevel(logging.INFO)
     else:
@@ -66,7 +70,14 @@ def process_main(rank, fname, world_size, devices):
             yaml.dump(params, f)
 
     # Init distributed (access to comm between GPUS on same machine)
-    world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
+    if int(world_size) <= 1:
+        logger.info("Single-process debug mode; skipping distributed init.")
+        world_size, rank = 1, int(rank)
+    else:
+        logger.info("Initializing distributed utilities...")
+        from src.utils.distributed import init_distributed
+
+        world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
     logger.info(f"Running... (rank: {rank}/{world_size})")
 
     # Launch the app with loaded config
@@ -74,7 +85,9 @@ def process_main(rank, fname, world_size, devices):
 
 
 if __name__ == "__main__":
+    _boot_log("entry")
     args = parser.parse_args()
+    _boot_log(f"parsed args debugmode={args.debugmode} fname={args.fname}")
     if args.debugmode:
         process_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"])
     else:

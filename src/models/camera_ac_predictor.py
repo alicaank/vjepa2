@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.utils.modules import ACBlock as Block
+from src.models.utils.modules import ACRoPEAttention
 from src.models.utils.modules import build_action_block_causal_attention_mask
 from src.utils.tensors import trunc_normal_
 
@@ -187,6 +188,32 @@ class CameraUCPETargetAttention(nn.Module):
         )
 
 
+class PredictorAdaLNModulation(nn.Module):
+    """Per-block AdaLN modulation for the CameraAC predictor.
+
+    Unlike DiT's AdaLN-Zero recipe, this path is not zero-initialized.  The
+    residual gates are used as near-identity multipliers (1 + delta) so the
+    block starts close to the normal ACBlock while still giving the camera
+    action/pose condition a direct path into every transformer layer.
+    """
+
+    def __init__(self, dim: int, hidden: int, act_layer=nn.SiLU):
+        super().__init__()
+        hidden = max(1, int(hidden))
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden, bias=True),
+            act_layer(),
+            nn.Linear(hidden, 6 * dim, bias=True),
+        )
+
+    def forward(self, cond: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return self.net(cond).chunk(6, dim=-1)
+
+
+def _adaln_modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
 class CameraConditionedPredictorAC(nn.Module):
     """
     Camera-pose-conditioned predictor with V-JEPA 2.1 hierarchical output heads.
@@ -260,6 +287,7 @@ class CameraConditionedPredictorAC(nn.Module):
         ray_pe_mode="origin_dir",
         ray_visibility_features="none",
         pose_conditioning_mode="token+raymap",
+        action_token_mode="transition",
         use_delta_head=False,
         use_residual_head=False,
         residual_head_depth=2,
@@ -301,6 +329,19 @@ class CameraConditionedPredictorAC(nn.Module):
         camera_ucpe_enabled=False,
         camera_ucpe_apply_layers=(0, 3, 6, 9),
         camera_ucpe_gamma_init=0.0,
+        coord_qk_enabled=False,
+        coord_qk_apply_layers=(0, 3, 6, 9),
+        coord_qk_hidden=256,
+        coord_qk_freqs=6,
+        coord_qk_gamma_init=0.1,
+        ray_qk_enabled=False,
+        ray_qk_apply_layers=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
+        ray_qk_gamma_init=0.5,
+        target_motion_query_enabled=False,
+        target_motion_query_hidden=128,
+        target_motion_query_gamma_init=0.1,
+        predictor_adaln_enabled=False,
+        predictor_adaln_hidden=512,
         **kwargs,
     ):
         super().__init__()
@@ -312,6 +353,18 @@ class CameraConditionedPredictorAC(nn.Module):
         self.use_residual_head = use_residual_head
         self.use_completion_head = bool(use_completion_head)
         self.use_fsq_head = bool(use_fsq_head)
+        action_token_mode = str(action_token_mode).lower().strip()
+        if action_token_mode not in ("transition", "target_relative"):
+            raise ValueError(
+                f"action_token_mode={action_token_mode!r} unsupported. "
+                "Expected one of: 'transition', 'target_relative'."
+            )
+        if action_token_mode == "target_relative" and int(state_dim) < 7:
+            raise ValueError(
+                "action_token_mode='target_relative' requires 7D SE(3) states "
+                "[tx, ty, tz, qx, qy, qz, qw]."
+            )
+        self.action_token_mode = action_token_mode
         # Rotation-only (infinity-plane) homography warp of context-frame
         # tokens into the target frame's 24x24 grid before interleaving
         # conditioning tokens. See ``_warp_context_tokens``.
@@ -462,6 +515,40 @@ class CameraConditionedPredictorAC(nn.Module):
         self.camera_ucpe_gamma_init = float(camera_ucpe_gamma_init)
         if self.camera_ucpe_enabled and not self.use_ray_pe:
             raise ValueError("camera_ucpe_enabled=True requires use_ray_pe=True so dense camera geometry tokens are available.")
+        self.coord_qk_enabled = bool(coord_qk_enabled)
+        self._coord_qk_apply_layers_raw = tuple(int(i) for i in coord_qk_apply_layers)
+        self.coord_qk_hidden = int(coord_qk_hidden)
+        self.coord_qk_freqs = int(coord_qk_freqs)
+        self.coord_qk_gamma_init = float(coord_qk_gamma_init)
+        if self.coord_qk_enabled:
+            if not self.use_intrinsics:
+                raise ValueError("coord_qk_enabled=True requires use_intrinsics=True.")
+            if self.coord_qk_hidden <= 0:
+                raise ValueError(f"coord_qk_hidden must be > 0; got {self.coord_qk_hidden}")
+            if self.coord_qk_freqs <= 0:
+                raise ValueError(f"coord_qk_freqs must be > 0; got {self.coord_qk_freqs}")
+        self.ray_qk_enabled = bool(ray_qk_enabled)
+        self._ray_qk_apply_layers_raw = tuple(int(i) for i in ray_qk_apply_layers)
+        self.ray_qk_gamma_init = float(ray_qk_gamma_init)
+        if self.ray_qk_enabled and not self.use_ray_pe:
+            raise ValueError("ray_qk_enabled=True requires use_ray_pe=True.")
+        self.target_motion_query_enabled = bool(target_motion_query_enabled)
+        self.target_motion_query_hidden = int(target_motion_query_hidden)
+        self.target_motion_query_gamma_init = float(target_motion_query_gamma_init)
+        if self.target_motion_query_enabled:
+            if not self.use_intrinsics:
+                raise ValueError("target_motion_query_enabled=True requires use_intrinsics=True.")
+            if self.target_motion_query_hidden <= 0:
+                raise ValueError(
+                    f"target_motion_query_hidden must be > 0; got {self.target_motion_query_hidden}"
+                )
+        self.predictor_adaln_enabled = bool(predictor_adaln_enabled)
+        self.predictor_adaln_hidden = int(predictor_adaln_hidden)
+        if self.predictor_adaln_enabled and not bool(use_rope):
+            raise ValueError(
+                "predictor_adaln_enabled=True is the AdaLN+RoPE v1 variant "
+                "and requires use_rope=True."
+            )
         self.fsq_total_code_axes = int(fsq_total_code_axes)
         self.fsq_levels = int(fsq_levels)
         self.predict_all = predict_all
@@ -670,7 +757,26 @@ class CameraConditionedPredictorAC(nn.Module):
                 torch.stack([xx, yy], dim=-1).reshape(-1, 2),
                 persistent=False,
             )
-
+        elif self.coord_qk_enabled:
+            gh, gw = self.grid_height, self.grid_width
+            cy_grid = (torch.arange(gh, dtype=torch.float32) + 0.5) / gh
+            cx_grid = (torch.arange(gw, dtype=torch.float32) + 0.5) / gw
+            yy, xx = torch.meshgrid(cy_grid, cx_grid, indexing="ij")
+            self.register_buffer(
+                "_ray_pixel_grid",
+                torch.stack([xx, yy], dim=-1).reshape(-1, 2),
+                persistent=False,
+            )
+        elif self.target_motion_query_enabled:
+            gh, gw = self.grid_height, self.grid_width
+            cy_grid = (torch.arange(gh, dtype=torch.float32) + 0.5) / gh
+            cx_grid = (torch.arange(gw, dtype=torch.float32) + 0.5) / gw
+            yy, xx = torch.meshgrid(cy_grid, cx_grid, indexing="ij")
+            self.register_buffer(
+                "_ray_pixel_grid",
+                torch.stack([xx, yy], dim=-1).reshape(-1, 2),
+                persistent=False,
+            )
         # ------------------------------------------------------------------ #
         # Tier 2a — Multi-layer input embedding (V-JEPA 2.1 hierarchical)
         # If n_hierarchical_layers == 1, a plain linear projection.
@@ -721,6 +827,26 @@ class CameraConditionedPredictorAC(nn.Module):
                 for i in range(depth)
             ]
         )
+        if self.predictor_adaln_enabled:
+            # Pool sparse camera tokens once per clip, project to the predictor
+            # width, then give every transformer block its own AdaLN head.
+            cond_inputs = 3 if self.use_intrinsics else 2
+            self.predictor_adaln_conditioner = nn.Sequential(
+                norm_layer(cond_inputs * predictor_embed_dim),
+                nn.Linear(cond_inputs * predictor_embed_dim, predictor_embed_dim, bias=True),
+                nn.SiLU(),
+                nn.Linear(predictor_embed_dim, predictor_embed_dim, bias=True),
+            )
+            self.predictor_adaln_modulators = nn.ModuleList(
+                [
+                    PredictorAdaLNModulation(
+                        dim=predictor_embed_dim,
+                        hidden=self.predictor_adaln_hidden,
+                        act_layer=nn.SiLU,
+                    )
+                    for _ in range(depth)
+                ]
+            )
         if self.camera_ucpe_enabled:
             apply_set = set(self._camera_ucpe_apply_layers_raw)
             invalid = [i for i in apply_set if i < 0 or i >= depth]
@@ -742,6 +868,48 @@ class CameraConditionedPredictorAC(nn.Module):
             )
         else:
             self.camera_ucpe_apply_layers = tuple()
+
+        if self.coord_qk_enabled:
+            apply_set = set(self._coord_qk_apply_layers_raw)
+            invalid = [i for i in apply_set if i < 0 or i >= depth]
+            if invalid:
+                raise ValueError(
+                    f"coord_qk_apply_layers entries must be in [0, {depth}); got out-of-range indices {sorted(invalid)}"
+                )
+            self.coord_qk_apply_layers = tuple(sorted(apply_set))
+            coord_in_dim = 3 + 2 * 3 * self.coord_qk_freqs
+            self.coord_qk_mlp = nn.Sequential(
+                nn.Linear(coord_in_dim, self.coord_qk_hidden, bias=True),
+                nn.GELU(),
+                nn.Linear(self.coord_qk_hidden, predictor_embed_dim, bias=True),
+            )
+            self.coord_qk_gamma = nn.Parameter(
+                torch.full((len(self.coord_qk_apply_layers),), self.coord_qk_gamma_init, dtype=torch.float32)
+            )
+        else:
+            self.coord_qk_apply_layers = tuple()
+        if self.ray_qk_enabled:
+            apply_set = set(self._ray_qk_apply_layers_raw)
+            invalid = [i for i in apply_set if i < 0 or i >= depth]
+            if invalid:
+                raise ValueError(
+                    f"ray_qk_apply_layers entries must be in [0, {depth}); got out-of-range indices {sorted(invalid)}"
+                )
+            self.ray_qk_apply_layers = tuple(sorted(apply_set))
+            self.ray_qk_gamma = nn.Parameter(
+                torch.full((len(self.ray_qk_apply_layers),), self.ray_qk_gamma_init, dtype=torch.float32)
+            )
+        else:
+            self.ray_qk_apply_layers = tuple()
+        if self.target_motion_query_enabled:
+            self.target_motion_query_mlp = nn.Sequential(
+                nn.Linear(11, self.target_motion_query_hidden, bias=True),
+                nn.GELU(),
+                nn.Linear(self.target_motion_query_hidden, predictor_embed_dim, bias=True),
+            )
+            self.target_motion_query_gamma = nn.Parameter(
+                torch.tensor(self.target_motion_query_gamma_init, dtype=torch.float32)
+            )
 
         # ------------------------------------------------------------------ #
         # Tier 2b — Output projection heads (V-JEPA 2.1 hierarchical)
@@ -887,6 +1055,17 @@ class CameraConditionedPredictorAC(nn.Module):
             with torch.no_grad():
                 for branch in self.camera_ucpe_branches.values():
                     branch.gamma.fill_(self.camera_ucpe_gamma_init)
+        if self.coord_qk_enabled:
+            with torch.no_grad():
+                self.coord_qk_gamma.fill_(self.coord_qk_gamma_init)
+        if self.ray_qk_enabled:
+            with torch.no_grad():
+                self.ray_qk_gamma.fill_(self.ray_qk_gamma_init)
+        if self.target_motion_query_enabled:
+            with torch.no_grad():
+                self.target_motion_query_gamma.fill_(self.target_motion_query_gamma_init)
+                self.target_motion_query_mlp[-1].weight.normal_(mean=0.0, std=1.0e-3)
+                self.target_motion_query_mlp[-1].bias.zero_()
         self._rescale_blocks()
 
         # Pre-compute and register the block-causal attention mask.
@@ -1547,6 +1726,55 @@ class CameraConditionedPredictorAC(nn.Module):
         return mask.reshape(B, HW, 1)
 
     @staticmethod
+    def _quat_xyzw_conjugate(q: torch.Tensor) -> torch.Tensor:
+        return torch.cat([-q[..., :3], q[..., 3:4]], dim=-1)
+
+    @staticmethod
+    def _quat_xyzw_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        x1, y1, z1, w1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        x2, y2, z2, w2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+        q = torch.stack([
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        ], dim=-1)
+        q = torch.nn.functional.normalize(q, dim=-1, eps=1.0e-8)
+        sign = torch.where(q[..., 3:4] < 0.0, -1.0, 1.0)
+        return q * sign
+
+    @staticmethod
+    def _context_to_target_actions_from_states(states: torch.Tensor) -> torch.Tensor:
+        """Return direct relative actions from each slot to the target slot.
+
+        The dataset action convention is ``state_t ∘ action_t = state_{t+1}``.
+        Therefore the direct action from context slot ``i`` to target slot
+        ``T-1`` is ``state_i^{-1} ∘ state_{T-1}``.
+        """
+        if states is None or states.size(-1) < 7:
+            raise ValueError(
+                "action_token_mode='target_relative' requires states with shape [B, T, >=7]."
+            )
+        t_ctx = states[..., :3]
+        q_ctx = torch.nn.functional.normalize(states[..., 3:7], dim=-1, eps=1.0e-8)
+        t_tgt = states[:, -1:, :3].expand_as(t_ctx)
+        q_tgt = torch.nn.functional.normalize(
+            states[:, -1:, 3:7].expand_as(q_ctx),
+            dim=-1,
+            eps=1.0e-8,
+        )
+        q_ctx_inv = CameraConditionedPredictorAC._quat_xyzw_conjugate(q_ctx)
+        r_ctx_inv = CameraConditionedPredictorAC._quat_xyzw_to_rotmat(q_ctx_inv)
+        t_rel = torch.einsum("...ij,...j->...i", r_ctx_inv, t_tgt - t_ctx)
+        q_rel = CameraConditionedPredictorAC._quat_xyzw_multiply(q_ctx_inv, q_tgt)
+        return torch.cat([t_rel, q_rel], dim=-1)
+
+    def _action_tokens_for_mode(self, actions: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
+        if self.action_token_mode == "target_relative":
+            return self._context_to_target_actions_from_states(states)
+        return actions
+
+    @staticmethod
     def _compose_state_action(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """Compose absolute SE(3) state with a relative action.
 
@@ -1558,14 +1786,7 @@ class CameraConditionedPredictorAC(nn.Module):
         t_a, q_a = action[..., :3], action[..., 3:7]
         R_s = CameraConditionedPredictorAC._quat_xyzw_to_rotmat(q_s)
         t_new = t_s + torch.einsum("...ij,...j->...i", R_s, t_a)
-        x1, y1, z1, w1 = q_s[..., 0], q_s[..., 1], q_s[..., 2], q_s[..., 3]
-        x2, y2, z2, w2 = q_a[..., 0], q_a[..., 1], q_a[..., 2], q_a[..., 3]
-        q_new = torch.stack([
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2,
-            w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        ], dim=-1)
+        q_new = CameraConditionedPredictorAC._quat_xyzw_multiply(q_s, q_a)
         return torch.cat([t_new, q_new], dim=-1)
 
     @staticmethod
@@ -1811,11 +2032,237 @@ class CameraConditionedPredictorAC(nn.Module):
 
         return self.action_ray_pe_mlp(action_feat)
 
+    def _compute_coord_qk_embed(
+        self,
+        geometry_depths: torch.Tensor,
+        states: torch.Tensor,
+        intrinsics: torch.Tensor,
+        B: int,
+        T: int,
+        D: int,
+    ) -> torch.Tensor:
+        """Project depth-aware token coordinates into the final target camera."""
+        del D
+        if geometry_depths.ndim != 4:
+            raise ValueError(
+                f"geometry_depths must be (B, T, H, W); got {tuple(geometry_depths.shape)}"
+            )
+        if geometry_depths.shape[0] != B or geometry_depths.shape[1] != T:
+            raise ValueError(
+                f"geometry_depths shape {tuple(geometry_depths.shape)} incompatible with B={B}, T={T}"
+            )
+        HW = self.grid_height * self.grid_width
+        H_img = int(geometry_depths.shape[-2])
+        W_img = int(geometry_depths.shape[-1])
+        dtype = intrinsics.dtype
+        device = intrinsics.device
+
+        depth_tok = F.avg_pool2d(
+            geometry_depths.reshape(B * T, 1, H_img, W_img).to(device=device, dtype=torch.float32),
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        ).reshape(B, T, HW).to(dtype=dtype).clamp_min(1.0e-3)
+
+        pixel_grid = self._ray_pixel_grid.to(device=device, dtype=dtype)
+        px = pixel_grid[:, 0]
+        py = pixel_grid[:, 1]
+        fx = intrinsics[:, :, 0:1].to(dtype=dtype).clamp_min(1.0e-6)
+        fy = intrinsics[:, :, 1:2].to(dtype=dtype).clamp_min(1.0e-6)
+        cx = intrinsics[:, :, 2:3].to(dtype=dtype)
+        cy = intrinsics[:, :, 3:4].to(dtype=dtype)
+
+        x_cam = (px.view(1, 1, HW) - cx) / fx * depth_tok
+        y_cam = (py.view(1, 1, HW) - cy) / fy * depth_tok
+        z_cam = depth_tok
+        pts_cam = torch.stack([x_cam, y_cam, z_cam], dim=-1)
+
+        R_src = self._quat_xyzw_to_rotmat(states[:, :, 3:7].to(dtype=dtype))
+        t_src = states[:, :, :3].to(dtype=dtype).unsqueeze(2)
+        pts_world = torch.einsum("btij,bthj->bthi", R_src, pts_cam) + t_src
+
+        R_tgt = R_src[:, -1]
+        t_tgt = states[:, -1, :3].to(dtype=dtype).view(B, 1, 1, 3)
+        pts_tgt = torch.einsum("bij,bthj->bthi", R_tgt.transpose(-1, -2), pts_world - t_tgt)
+        z_tgt = pts_tgt[..., 2:3].clamp_min(1.0e-3)
+
+        fx_t = intrinsics[:, -1, 0:1].to(dtype=dtype).view(B, 1, 1)
+        fy_t = intrinsics[:, -1, 1:2].to(dtype=dtype).view(B, 1, 1)
+        cx_t = intrinsics[:, -1, 2:3].to(dtype=dtype).view(B, 1, 1)
+        cy_t = intrinsics[:, -1, 3:4].to(dtype=dtype).view(B, 1, 1)
+        u_t = fx_t * (pts_tgt[..., 0] / z_tgt[..., 0]) + cx_t
+        v_t = fy_t * (pts_tgt[..., 1] / z_tgt[..., 0]) + cy_t
+        log_z = torch.tanh(torch.log(z_tgt[..., 0].clamp_min(1.0e-3)) / 4.0)
+
+        coord = torch.stack(
+            [(u_t - 0.5) * 2.0, (v_t - 0.5) * 2.0, log_z],
+            dim=-1,
+        ).clamp(-4.0, 4.0)
+        freqs = torch.arange(self.coord_qk_freqs, device=device, dtype=dtype)
+        freqs = (2.0 ** freqs).view(1, 1, 1, 1, self.coord_qk_freqs)
+        phase = coord.unsqueeze(-1) * freqs * math.pi
+        feat = torch.cat(
+            [coord, torch.sin(phase).flatten(-2), torch.cos(phase).flatten(-2)],
+            dim=-1,
+        )
+        mlp_dtype = next(self.coord_qk_mlp.parameters()).dtype
+        return self.coord_qk_mlp(feat.to(dtype=mlp_dtype)).to(dtype=dtype)
+
+    def _compute_target_motion_query(
+        self,
+        states: torch.Tensor,
+        intrinsics: torch.Tensor,
+        B: int,
+        T: int,
+        D: int,
+    ) -> torch.Tensor:
+        """Projected same-pixel displacement query from frame t to frame t-1.
+
+        This is a WorldCam-style explicit camera-motion side channel. For each
+        patch center in frame t, it backprojects a unit-depth point, transforms
+        it into the previous camera, projects it, and encodes the resulting
+        optical displacement plus validity/depth and relative translation.
+        Unit depth avoids target-frame depth leakage while still exposing the
+        direction and approximate magnitude of camera-induced parallax.
+        """
+        del D
+        HW = self.grid_height * self.grid_width
+        dtype = intrinsics.dtype
+        device = intrinsics.device
+        pixel_grid = self._ray_pixel_grid.to(device=device, dtype=dtype)
+        px = pixel_grid[:, 0]
+        py = pixel_grid[:, 1]
+
+        fx_t = intrinsics[:, :, 0:1].to(dtype=dtype).clamp_min(1.0e-6)
+        fy_t = intrinsics[:, :, 1:2].to(dtype=dtype).clamp_min(1.0e-6)
+        cx_t = intrinsics[:, :, 2:3].to(dtype=dtype)
+        cy_t = intrinsics[:, :, 3:4].to(dtype=dtype)
+        ray_x = (px.view(1, 1, HW) - cx_t) / fx_t
+        ray_y = (py.view(1, 1, HW) - cy_t) / fy_t
+        pts_cam_t = torch.stack([ray_x, ray_y, torch.ones_like(ray_x)], dim=-1)
+
+        R_t = self._quat_xyzw_to_rotmat(states[:, :, 3:7].to(dtype=dtype))
+        t_t = states[:, :, :3].to(dtype=dtype).unsqueeze(2)
+        pts_world = torch.einsum("btij,bthj->bthi", R_t, pts_cam_t) + t_t
+
+        states_prev = torch.cat([states[:, 0:1], states[:, :-1]], dim=1).to(dtype=dtype)
+        intr_prev = torch.cat([intrinsics[:, 0:1], intrinsics[:, :-1]], dim=1).to(dtype=dtype)
+        R_prev = self._quat_xyzw_to_rotmat(states_prev[:, :, 3:7])
+        t_prev = states_prev[:, :, :3].unsqueeze(2)
+        pts_prev = torch.einsum("btji,bthj->bthi", R_prev, pts_world - t_prev)
+        z_prev = pts_prev[..., 2:3]
+
+        fx_p = intr_prev[:, :, 0:1].clamp_min(1.0e-6).unsqueeze(2)
+        fy_p = intr_prev[:, :, 1:2].clamp_min(1.0e-6).unsqueeze(2)
+        cx_p = intr_prev[:, :, 2:3].unsqueeze(2)
+        cy_p = intr_prev[:, :, 3:4].unsqueeze(2)
+        safe_z = torch.where(z_prev.abs() > 1.0e-6, z_prev, torch.full_like(z_prev, 1.0e-6))
+        uv_prev_x = fx_p * (pts_prev[..., 0:1] / safe_z) + cx_p
+        uv_prev_y = fy_p * (pts_prev[..., 1:2] / safe_z) + cy_p
+        uv_prev = torch.cat([uv_prev_x, uv_prev_y], dim=-1)
+        uv_cur = pixel_grid.view(1, 1, HW, 2).expand(B, T, -1, -1)
+        duv = (uv_cur - uv_prev).clamp(-4.0, 4.0)
+        valid = (
+            (z_prev > 1.0e-6)
+            & (uv_prev_x >= 0.0) & (uv_prev_x <= 1.0)
+            & (uv_prev_y >= 0.0) & (uv_prev_y <= 1.0)
+        ).to(dtype=dtype)
+        border = torch.minimum(
+            torch.minimum(uv_prev_x, 1.0 - uv_prev_x),
+            torch.minimum(uv_prev_y, 1.0 - uv_prev_y),
+        ).clamp(-0.5, 0.5)
+        t_rel_prev = torch.einsum(
+            "btji,btj->bti",
+            R_prev,
+            states[:, :, :3].to(dtype=dtype) - states_prev[:, :, :3],
+        )
+        t_rel_prev[:, 0].zero_()
+        t_rel_tok = t_rel_prev.unsqueeze(2).expand(-1, -1, HW, -1)
+        t_norm = t_rel_prev.norm(dim=-1, keepdim=True).unsqueeze(2).expand(-1, -1, HW, -1)
+        log_z = torch.tanh(torch.log(z_prev.abs().clamp_min(1.0e-3)) / 4.0)
+        feat = torch.cat(
+            [
+                uv_prev.clamp(-4.0, 4.0),
+                duv,
+                valid,
+                border,
+                log_z,
+                t_rel_tok.clamp(-4.0, 4.0),
+                t_norm.clamp(0.0, 4.0),
+            ],
+            dim=-1,
+        )
+        mlp_dtype = next(self.target_motion_query_mlp.parameters()).dtype
+        return self.target_motion_query_mlp(feat.to(dtype=mlp_dtype)).to(dtype=dtype)
+
+    @staticmethod
+    def _interleave_visual_sidechannel(visual_embed: torch.Tensor, cond_tokens: int) -> torch.Tensor:
+        B, T, _HW, D = visual_embed.shape
+        if cond_tokens <= 0:
+            return visual_embed.flatten(1, 2)
+        zeros = visual_embed.new_zeros(B, T, cond_tokens, D)
+        return torch.cat([zeros, visual_embed], dim=2).flatten(1, 2)
+
+    def _build_adaln_condition(
+        self,
+        action_token_embed: torch.Tensor,
+        state_token_embed: torch.Tensor,
+        intrinsics_token_embed: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if not self.predictor_adaln_enabled:
+            return None
+        pooled = [
+            action_token_embed.squeeze(2).mean(dim=1),
+            state_token_embed.squeeze(2).mean(dim=1),
+        ]
+        if self.use_intrinsics:
+            if intrinsics_token_embed is None:
+                raise RuntimeError("AdaLN+RoPE predictor expected intrinsics conditioning.")
+            pooled.append(intrinsics_token_embed.squeeze(2).mean(dim=1))
+        cond = torch.cat(pooled, dim=-1)
+        cond_dtype = next(self.predictor_adaln_conditioner.parameters()).dtype
+        return self.predictor_adaln_conditioner(cond.to(dtype=cond_dtype)).to(dtype=action_token_embed.dtype)
+
+    def _forward_adaln_block(
+        self,
+        blk: nn.Module,
+        block_idx: int,
+        x: torch.Tensor,
+        adaln_cond: torch.Tensor,
+        mask=None,
+        attn_mask=None,
+        T=None,
+        H=None,
+        W=None,
+        action_tokens=0,
+        qk_mod=None,
+    ) -> torch.Tensor:
+        sh_a, sc_a, ga_a, sh_m, sc_m, ga_m = self.predictor_adaln_modulators[block_idx](adaln_cond)
+
+        y = _adaln_modulate(blk.norm1(x), sh_a, sc_a)
+        if isinstance(blk.attn, ACRoPEAttention):
+            y = blk.attn(
+                y,
+                mask=mask,
+                attn_mask=attn_mask,
+                T=T,
+                H=H,
+                W=W,
+                action_tokens=action_tokens,
+                qk_mod=qk_mod,
+            )
+        else:
+            y = blk.attn(y, mask=mask, attn_mask=attn_mask)
+        x = x + blk.drop_path((1.0 + ga_a.unsqueeze(1)) * y)
+
+        y = _adaln_modulate(blk.norm2(x), sh_m, sc_m)
+        x = x + blk.drop_path((1.0 + ga_m.unsqueeze(1)) * blk.mlp(y))
+        return x
+
     # ---------------------------------------------------------------------- #
     # Forward
     # ---------------------------------------------------------------------- #
 
-    def forward(self, x, actions, states, intrinsics=None, target_depth=None):
+    def forward(self, x, actions, states, intrinsics=None, target_depth=None, geometry_depths=None):
         """
         Args:
             x: Visual context tokens from the (target) encoder.
@@ -1827,6 +2274,9 @@ class CameraConditionedPredictorAC(nn.Module):
                Shape: [B, T, state_dim].
             intrinsics: Camera intrinsics per frame (optional).
                Shape: [B, T, intrinsics_dim].
+            geometry_depths: Optional projective depth for all frame slots,
+               shape [B, T, H, W]. When coord_qk is enabled this builds
+               depth-aware coordinate embeddings added to attention Q/K only.
 
         Returns:
             predictions: Projected frame-level predictions.
@@ -1845,6 +2295,10 @@ class CameraConditionedPredictorAC(nn.Module):
                != "off" and T>1, else None).  Used by ``residual_target`` loss.
                Shape: [B, HW, n_hierarchical_layers * embed_dim].
         """
+        capture_ray_debug = bool(getattr(self, "_capture_ray_conditioning", False))
+        self._last_ray_conditioning = None
+        ray_debug = {} if capture_ray_debug else None
+
         # Path B-lite Step 1: optionally compute target-frame depth from
         # the **raw** 4-layer concat features (pre ``predictor_embed``).
         # The probe is a frozen ``nn.Linear(input_token_dim, 1)`` distilled
@@ -1906,6 +2360,10 @@ class CameraConditionedPredictorAC(nn.Module):
         x = self.predictor_embed(x)
         B, N_ctxt, D = x.size()
         T = N_ctxt // (self.grid_height * self.grid_width)
+        HW = self.grid_height * self.grid_width
+        if ray_debug is not None:
+            ray_debug["raw_pre_embed_target"] = x_raw.view(B, T, HW, -1)[:, -1].detach()
+            ray_debug["post_embed_target"] = x.view(B, T, HW, D)[:, -1].detach()
 
         if self.use_intrinsics and intrinsics is None:
             raise ValueError(
@@ -1932,6 +2390,8 @@ class CameraConditionedPredictorAC(nn.Module):
                 target_depth=target_depth,
                 depth_gate=depth_gate,
             )
+            if ray_debug is not None:
+                ray_debug["post_warp_target"] = x.view(B, T, HW, D)[:, -1].detach()
 
         # P0.6: expose target_depth for diagnostic logging in train.py without
         # changing the return signature.  Reset to None at the start of each
@@ -1948,8 +2408,13 @@ class CameraConditionedPredictorAC(nn.Module):
         ray_embed = None
         if self.use_ray_pe and intrinsics is not None:
             ray_embed = self._compute_ray_pe(intrinsics, states, B, T, D)
-            x_with_ray = x.view(B, T, self.grid_height * self.grid_width, D)
+            x_with_ray = x.view(B, T, HW, D)
+            if ray_debug is not None:
+                ray_debug["pre_ray_target"] = x_with_ray[:, -1].detach()
+                ray_debug["ray_pe_target"] = ray_embed[:, -1].detach()
             x = (x_with_ray + ray_embed).flatten(1, 2)
+            if ray_debug is not None:
+                ray_debug["post_ray_target"] = x.view(B, T, HW, D)[:, -1].detach()
 
         # raymap_dual: also add a dense per-patch action raymap so the action
         # signal is delivered through the same per-token pathway as state,
@@ -1960,14 +2425,41 @@ class CameraConditionedPredictorAC(nn.Module):
             and intrinsics is not None
         ):
             action_embed = self._compute_action_ray_pe(actions, intrinsics, B, T, D)
-            x_with_act = x.view(B, T, self.grid_height * self.grid_width, D)
+            x_with_act = x.view(B, T, HW, D)
+            if ray_debug is not None:
+                ray_debug["action_ray_pe_target"] = action_embed[:, -1].detach()
             x = (x_with_act + action_embed).flatten(1, 2)
+            if ray_debug is not None:
+                ray_debug["post_action_ray_target"] = x.view(B, T, HW, D)[:, -1].detach()
 
-        # -- encode camera conditioning tokens → [B, T, 1, D] each
-        a = self.action_encoder(actions).unsqueeze(2)    # [B, T, 1, D]
+        if self.target_motion_query_enabled and states is not None and intrinsics is not None:
+            motion_query = self._compute_target_motion_query(states, intrinsics, B, T, D)
+            gamma = self.target_motion_query_gamma.to(device=x.device, dtype=x.dtype)
+            x_with_motion = x.view(B, T, HW, D)
+            x = (x_with_motion + gamma * motion_query.to(dtype=x.dtype)).flatten(1, 2)
+            if ray_debug is not None:
+                ray_debug["post_motion_query_target"] = x.view(B, T, HW, D)[:, -1].detach()
+
+        # -- encode camera conditioning tokens → [B, T, 1, D] each.
+        # ``transition`` preserves the original dataset delta token. The
+        # target-relative mode instead gives every context slot its direct SE(3)
+        # action to the target frame, which is better aligned with rollout
+        # prediction than the local previous→current transition.
+        action_tokens = self._action_tokens_for_mode(actions, states)
+        a = self.action_encoder(action_tokens).unsqueeze(2)    # [B, T, 1, D]
+        s = self.state_encoder(states).unsqueeze(2)             # [B, T, 1, D]
+        k = None
+        if self.use_intrinsics and intrinsics is not None:
+            k = self.intrinsics_encoder(intrinsics).unsqueeze(2)
+        adaln_cond = self._build_adaln_condition(a, s, k)
+        if ray_debug is not None:
+            ray_debug["action_token_target"] = a[:, -1, 0].detach()
+            ray_debug["state_token_target"] = s[:, -1, 0].detach()
+            if k is not None:
+                ray_debug["intrinsics_token_target"] = k[:, -1, 0].detach()
 
         # -- reshape visual tokens for per-frame interleaving
-        x_frames = x.view(B, T, self.grid_height * self.grid_width, D)  # [B, T, H*W, D]
+        x_frames = x.view(B, T, HW, D)  # [B, T, H*W, D]
 
         # Pose-conditioning layout (see ``self.pose_conditioning_mode`` in
         # ``__init__``). ``token+raymap`` (default, legacy): include the dense
@@ -1978,9 +2470,7 @@ class CameraConditionedPredictorAC(nn.Module):
         # the per-frame conditioning layout below or the precomputed
         # ``attn_mask`` and post-block reshape will silently mis-slice.
         if self.pose_conditioning_mode == "token+raymap":
-            s = self.state_encoder(states).unsqueeze(2)      # [B, T, 1, D]
             if self.use_intrinsics and intrinsics is not None:
-                k = self.intrinsics_encoder(intrinsics).unsqueeze(2)
                 # interleave: [action | state | intrinsics | patches]
                 x_seq = torch.cat([a, s, k, x_frames], dim=2).flatten(1, 2)  # [B, T*(3+H*W), D]
             else:
@@ -1988,7 +2478,6 @@ class CameraConditionedPredictorAC(nn.Module):
                 x_seq = torch.cat([a, s, x_frames], dim=2).flatten(1, 2)     # [B, T*(2+H*W), D]
         elif self.pose_conditioning_mode == "raymap_only":
             if self.use_intrinsics and intrinsics is not None:
-                k = self.intrinsics_encoder(intrinsics).unsqueeze(2)
                 # interleave: [action | intrinsics | patches+raymap]
                 x_seq = torch.cat([a, k, x_frames], dim=2).flatten(1, 2)     # [B, T*(2+H*W), D]
             else:
@@ -2000,12 +2489,44 @@ class CameraConditionedPredictorAC(nn.Module):
             # information lives in the per-patch action raymap (both already
             # added to ``x_frames`` above).
             if self.use_intrinsics and intrinsics is not None:
-                k = self.intrinsics_encoder(intrinsics).unsqueeze(2)
                 # interleave: [intrinsics | patches+state_raymap+action_raymap]
                 x_seq = torch.cat([k, x_frames], dim=2).flatten(1, 2)        # [B, T*(1+H*W), D]
             else:
                 # interleave: [patches+state_raymap+action_raymap]
                 x_seq = x_frames.flatten(1, 2)                                # [B, T*(H*W), D]
+        if ray_debug is not None:
+            x_seq_frames_debug = x_seq.view(B, T, self.cond_tokens + HW, D)
+            ray_debug["after_concat_target_cond"] = x_seq_frames_debug[:, -1, :self.cond_tokens, :].detach()
+            ray_debug["after_concat_target_visual"] = x_seq_frames_debug[:, -1, self.cond_tokens:, :].detach()
+
+        coord_qk_seq = None
+        coord_qk_apply_idx_map = {}
+        ray_qk_seq = None
+        ray_qk_apply_idx_map = {}
+        if self.coord_qk_enabled and states is not None and intrinsics is not None:
+            if geometry_depths is None:
+                geometry_depths = x_seq.new_ones(B, T, self.img_height, self.img_width)
+            coord_visual = self._compute_coord_qk_embed(
+                geometry_depths,
+                states,
+                intrinsics,
+                B,
+                T,
+                D,
+            )
+            coord_qk_seq = self._interleave_visual_sidechannel(coord_visual, self.cond_tokens)
+            coord_qk_apply_idx_map = {
+                block_idx: pos
+                for pos, block_idx in enumerate(self.coord_qk_apply_layers)
+            }
+        if self.ray_qk_enabled:
+            if ray_embed is None:
+                raise RuntimeError("ray_qk_enabled=True requires ray_embed in forward().")
+            ray_qk_seq = self._interleave_visual_sidechannel(ray_embed, self.cond_tokens)
+            ray_qk_apply_idx_map = {
+                block_idx: pos
+                for pos, block_idx in enumerate(self.ray_qk_apply_layers)
+            }
 
         # -- slice causal mask to actual sequence length
         seq_len = x_seq.size(1)
@@ -2075,30 +2596,122 @@ class CameraConditionedPredictorAC(nn.Module):
             return attn_mask.unsqueeze(0).unsqueeze(0) + extra
 
         # -- transformer forward pass
+        capture_rayqk_attention = bool(getattr(self, "_capture_rayqk_attention", False))
+        requested_rayqk_attention_layers = set(
+            int(v) for v in getattr(self, "_rayqk_attention_layers", ())
+        )
+        rayqk_attention_target_tokens = list(
+            int(v) for v in getattr(self, "_rayqk_attention_target_tokens", ())
+        )
         for block_idx, blk in enumerate(self.predictor_blocks):
             blk_attn_mask = _per_block_mask(block_idx)
+            qk_mod = None
+            if coord_qk_seq is not None and block_idx in coord_qk_apply_idx_map:
+                gamma = self.coord_qk_gamma[coord_qk_apply_idx_map[block_idx]]
+                qk_mod = coord_qk_seq * gamma.to(dtype=coord_qk_seq.dtype)
+            if ray_qk_seq is not None and block_idx in ray_qk_apply_idx_map:
+                gamma = self.ray_qk_gamma[ray_qk_apply_idx_map[block_idx]]
+                ray_mod = ray_qk_seq * gamma.to(dtype=ray_qk_seq.dtype)
+                if ray_debug is not None:
+                    ray_mod_frames = ray_mod.view(
+                        B,
+                        T,
+                        self.cond_tokens + self.grid_height * self.grid_width,
+                        D,
+                    )
+                    ray_debug.setdefault("ray_qk_blocks", []).append({
+                        "block": int(block_idx),
+                        "gamma": float(gamma.detach().float().cpu().item()),
+                        "target_mod": ray_mod_frames[:, -1, self.cond_tokens:, :].detach(),
+                    })
+                qk_mod = ray_mod if qk_mod is None else qk_mod + ray_mod
+            attn_debug_enabled = (
+                capture_ray_debug
+                and capture_rayqk_attention
+                and isinstance(getattr(blk, "attn", None), ACRoPEAttention)
+                and int(block_idx) in requested_rayqk_attention_layers
+            )
+            if attn_debug_enabled:
+                setattr(blk.attn, "_rayqk_debug_request", {
+                    "block": int(block_idx),
+                    "target_tokens": rayqk_attention_target_tokens,
+                })
+                setattr(blk.attn, "_last_rayqk_debug_payload", None)
+            elif isinstance(getattr(blk, "attn", None), ACRoPEAttention):
+                setattr(blk.attn, "_rayqk_debug_request", None)
+                setattr(blk.attn, "_last_rayqk_debug_payload", None)
             if self.use_activation_checkpointing:
-                x_seq = torch.utils.checkpoint.checkpoint(
-                    blk,
-                    x_seq,
-                    None,           # mask
-                    blk_attn_mask.clone() if blk_attn_mask is not None else None,
-                    T,
-                    self.grid_height,
-                    self.grid_width,
-                    self.cond_tokens,
-                    use_reentrant=False,
-                )
+                if adaln_cond is not None:
+                    qk_arg = qk_mod if qk_mod is not None else torch.zeros_like(x_seq)
+
+                    def _adaln_checkpoint(x_in, cond_in, qk_in, mask_in):
+                        return self._forward_adaln_block(
+                            blk,
+                            block_idx,
+                            x_in,
+                            cond_in,
+                            mask=None,
+                            attn_mask=mask_in,
+                            T=T,
+                            H=self.grid_height,
+                            W=self.grid_width,
+                            action_tokens=self.cond_tokens,
+                            qk_mod=qk_in,
+                        )
+
+                    x_seq = torch.utils.checkpoint.checkpoint(
+                        _adaln_checkpoint,
+                        x_seq,
+                        adaln_cond,
+                        qk_arg,
+                        blk_attn_mask.clone() if blk_attn_mask is not None else None,
+                        use_reentrant=False,
+                    )
+                else:
+                    x_seq = torch.utils.checkpoint.checkpoint(
+                        blk,
+                        x_seq,
+                        None,           # mask
+                        blk_attn_mask.clone() if blk_attn_mask is not None else None,
+                        T,
+                        self.grid_height,
+                        self.grid_width,
+                        self.cond_tokens,
+                        qk_mod,
+                        use_reentrant=False,
+                    )
             else:
-                x_seq = blk(
-                    x_seq,
-                    mask=None,
-                    attn_mask=blk_attn_mask,
-                    T=T,
-                    H=self.grid_height,
-                    W=self.grid_width,
-                    action_tokens=self.cond_tokens,
-                )
+                if adaln_cond is not None:
+                    x_seq = self._forward_adaln_block(
+                        blk,
+                        block_idx,
+                        x_seq,
+                        adaln_cond,
+                        mask=None,
+                        attn_mask=blk_attn_mask,
+                        T=T,
+                        H=self.grid_height,
+                        W=self.grid_width,
+                        action_tokens=self.cond_tokens,
+                        qk_mod=qk_mod,
+                    )
+                else:
+                    x_seq = blk(
+                        x_seq,
+                        mask=None,
+                        attn_mask=blk_attn_mask,
+                        T=T,
+                        H=self.grid_height,
+                        W=self.grid_width,
+                        action_tokens=self.cond_tokens,
+                        qk_mod=qk_mod,
+                    )
+            if attn_debug_enabled and ray_debug is not None:
+                payload = getattr(blk.attn, "_last_rayqk_debug_payload", None)
+                if payload is not None:
+                    ray_debug.setdefault("ray_qk_attention_debug", []).append(payload)
+                setattr(blk.attn, "_rayqk_debug_request", None)
+                setattr(blk.attn, "_last_rayqk_debug_payload", None)
             if self.camera_ucpe_enabled and block_idx in self.camera_ucpe_apply_layers:
                 if ray_embed is None:
                     raise RuntimeError("camera_ucpe_enabled=True requires ray_embed in forward().")
@@ -2113,8 +2726,12 @@ class CameraConditionedPredictorAC(nn.Module):
         # -- split conditioning slots from visual patch slots
         #    layout per frame: [cond_0 .. cond_{K-1} | patch_0 .. patch_{HW-1}]
         x_seq = x_seq.view(B, T, self.cond_tokens + self.grid_height * self.grid_width, D)
+        if ray_debug is not None:
+            ray_debug["post_transformer_target_visual"] = x_seq[:, -1, self.cond_tokens:, :].detach()
         x_visual = x_seq[:, :, self.cond_tokens:, :].flatten(1, 2)   # [B, T*H*W, D]
         x_visual = self.predictor_norm(x_visual)
+        if ray_debug is not None:
+            ray_debug["post_norm_target_visual"] = x_visual.view(B, T, HW, D)[:, -1].detach()
 
         # Residual head (optional) refines `x_visual` before it feeds every
         # output projection. Sharing the refined features across the primary,
@@ -2143,6 +2760,9 @@ class CameraConditionedPredictorAC(nn.Module):
             # and fsq_head see identical features; callers train whichever
             # losses they want on top.
             fsq_logits = self.fsq_head(head_input)
+
+        if ray_debug is not None:
+            self._last_ray_conditioning = ray_debug
 
         return predictions, context_predictions, delta_predictions, fsq_logits, warped_context_raw
 

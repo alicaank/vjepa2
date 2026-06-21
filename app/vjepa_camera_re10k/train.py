@@ -669,6 +669,7 @@ def main(args, resume_preempt=False):
     # state token is dropped; pose lives entirely in the dense per-patch
     # raymap PE. Requires ``use_ray_pe=True``. See @docs/RAYMAP_V3_DESIGN.md.
     pose_conditioning_mode = str(cfgs_model.get("pose_conditioning_mode", "token+raymap"))
+    action_token_mode = str(cfgs_model.get("action_token_mode", "transition"))
     # RayMap v4c (2026-05-01): ray_visibility_features adds rotation-only warp
     # correspondence block (uv_warp, valid, border) to plucker_pair. See
     # @docs/CAMERA_PREDICTOR_FULL_HISTORY.md §4.6.
@@ -720,6 +721,8 @@ def main(args, resume_preempt=False):
     camera_ucpe_enabled = bool(cfgs_model.get("camera_ucpe_enabled", False))
     camera_ucpe_apply_layers = tuple(int(i) for i in cfgs_model.get("camera_ucpe_apply_layers", [0, 3, 6, 9]))
     camera_ucpe_gamma_init = float(cfgs_model.get("camera_ucpe_gamma_init", 0.0))
+    predictor_adaln_enabled = bool(cfgs_model.get("predictor_adaln_enabled", False))
+    predictor_adaln_hidden = int(cfgs_model.get("predictor_adaln_hidden", 512))
     use_posthoc_completion_blend = bool(cfgs_model.get("use_posthoc_completion_blend", True))
 
     # ------------------------------------------------------------------ #
@@ -750,7 +753,6 @@ def main(args, resume_preempt=False):
         )
     else:
         logger.info("Phase E1 correspondence bias: disabled.")
-
     # -- FSQ categorical head (optional). Enabled by `model.use_fsq_head: true`.
     # Pretrained FSQ tokenizer path is read from meta so the FSQ weights can
     # live alongside the pretrain checkpoint without polluting model config.
@@ -1029,6 +1031,28 @@ def main(args, resume_preempt=False):
             "always be None so residual_target is a no-op. Forcing residual_target=False."
         )
         residual_target = False
+    residual_target_reconstruct = bool(
+        cfgs_loss.get("residual_target_reconstruct", residual_target)
+    )
+    residual_full_loss_weight = float(
+        cfgs_loss.get("residual_full_loss_weight", 0.0)
+    )
+    if not residual_target:
+        residual_target_reconstruct = False
+        residual_full_loss_weight = 0.0
+
+    def _reconstruct_residual_prediction(preds, warped_context_raw):
+        if (
+            residual_target
+            and residual_target_reconstruct
+            and warped_context_raw is not None
+        ):
+            return preds + warped_context_raw.to(
+                device=preds.device,
+                dtype=preds.dtype,
+            )
+        return preds
+
     rollout_train_steps = max(1, int(cfgs_loss.get("rollout_train_steps", 1)))
     rollout_loss_decay = float(cfgs_loss.get("rollout_loss_decay", 0.5))
 
@@ -1067,6 +1091,51 @@ def main(args, resume_preempt=False):
             rollout_loss_decay,
             scheduled_sampling_prob,
             scheduled_sampling_warmup_epochs,
+        )
+
+    # VGGT-World / JEPA-WMS-style soft self-conditioning. Scheduled sampling
+    # decides whether a rollout step uses the model prediction or the teacher
+    # target as the next context slot; this optional curriculum softens the
+    # self-fed branch itself by blending the predicted context with the GT
+    # latent:
+    #   c_next = (1 - lambda) * z_gt + lambda * z_pred
+    # ``mode=linear`` uses one deterministic epoch-level lambda. ``mode=beta``
+    # samples a per-sample lambda from a broadening Beta distribution, giving
+    # the v1 rollout trainer a continuous context-quality spectrum analogous to
+    # the v2 flow-forcing context-noise curriculum.
+    cfgs_context_mix = cfgs_loss.get("rollout_context_mix", {}) or {}
+    rollout_context_mix_enabled = bool(cfgs_context_mix.get("enabled", False))
+    rollout_context_mix_mode = str(cfgs_context_mix.get("mode", "linear")).lower()
+    if rollout_context_mix_mode not in {"linear", "beta"}:
+        logger.warning(
+            "Unknown rollout_context_mix.mode=%r; falling back to 'linear'",
+            rollout_context_mix_mode,
+        )
+        rollout_context_mix_mode = "linear"
+    rollout_context_mix_max_lambda = min(
+        max(float(cfgs_context_mix.get("max_lambda", 1.0)), 0.0),
+        1.0,
+    )
+    rollout_context_mix_start_epoch = int(cfgs_context_mix.get("start_epoch", 0))
+    rollout_context_mix_ramp_end_epoch = int(
+        cfgs_context_mix.get("ramp_end_epoch", max(1, scheduled_sampling_warmup_epochs))
+    )
+    rollout_context_mix_beta_start_a = max(float(cfgs_context_mix.get("beta_start_a", 2.0)), 1.0e-4)
+    rollout_context_mix_beta_start_b = max(float(cfgs_context_mix.get("beta_start_b", 8.0)), 1.0e-4)
+    rollout_context_mix_beta_end_a = max(float(cfgs_context_mix.get("beta_end_a", 2.0)), 1.0e-4)
+    rollout_context_mix_beta_end_b = max(float(cfgs_context_mix.get("beta_end_b", 2.0)), 1.0e-4)
+    if rollout_context_mix_enabled:
+        logger.info(
+            "Rollout context mix: enabled mode=%s max_lambda=%.3f start_epoch=%d "
+            "ramp_end_epoch=%d beta_start=(%.3f, %.3f) beta_end=(%.3f, %.3f)",
+            rollout_context_mix_mode,
+            rollout_context_mix_max_lambda,
+            rollout_context_mix_start_epoch,
+            rollout_context_mix_ramp_end_epoch,
+            rollout_context_mix_beta_start_a,
+            rollout_context_mix_beta_start_b,
+            rollout_context_mix_beta_end_a,
+            rollout_context_mix_beta_end_b,
         )
 
     # A3: Gaussian perturbation applied to self-fed predicted latents during
@@ -1304,6 +1373,7 @@ def main(args, resume_preempt=False):
         ray_pe_mode=ray_pe_mode,
         ray_visibility_features=ray_visibility_features,
         pose_conditioning_mode=pose_conditioning_mode,
+        action_token_mode=action_token_mode,
         use_delta_head=use_delta_head,
         use_residual_head=use_residual_head,
         residual_head_depth=residual_head_depth,
@@ -1338,6 +1408,8 @@ def main(args, resume_preempt=False):
         camera_ucpe_enabled=camera_ucpe_enabled,
         camera_ucpe_apply_layers=camera_ucpe_apply_layers,
         camera_ucpe_gamma_init=camera_ucpe_gamma_init,
+        predictor_adaln_enabled=predictor_adaln_enabled,
+        predictor_adaln_hidden=predictor_adaln_hidden,
         correspondence_bias_enabled=correspondence_bias_enabled,
         correspondence_bias_mode=correspondence_bias_mode,
         correspondence_bias_sigma_tokens=correspondence_bias_sigma_tokens,
@@ -1683,10 +1755,14 @@ def main(args, resume_preempt=False):
     logger.info(
         "Loss config: normalize_reps=%s, per_layer_balance=%s, loss_exp=%.3f, "
         "rollout_train_steps=%d, motion_weighted=%s (mode=%s, alpha=%.2f), "
-        "intermediate_supervision=%s.",
+        "intermediate_supervision=%s, residual_target=%s "
+        "(reconstruct=%s full_w=%.3f).",
         normalize_reps, per_layer_balance, float(loss_exp), rollout_train_steps,
         motion_weighted, motion_weight_mode, motion_weight_alpha,
         intermediate_supervision_enabled,
+        residual_target,
+        residual_target_reconstruct,
+        residual_full_loss_weight,
     )
     if intermediate_supervision_enabled:
         logger.info(
@@ -2040,9 +2116,15 @@ def main(args, resume_preempt=False):
             return True
         return False
 
-    logger.info("Initializing loader...")
+    logger.info(
+        "Initializing loader... num_workers=%s persistent_workers=%s pin_memory=%s",
+        num_workers,
+        bool(persistent_workers and num_workers > 0),
+        pin_mem,
+    )
     unsupervised_sampler.set_epoch(start_epoch)
     loader = iter(unsupervised_loader)
+    logger.info("Loader iterator initialized.")
 
     if skip_batches > 0:
         logger.info(f"Skip {skip_batches} batches")
@@ -2364,6 +2446,10 @@ def main(args, resume_preempt=False):
                 ),
                 target_depth=target_depth_eval,
             )
+            preds_v_next = _reconstruct_residual_prediction(
+                preds_v[:, -HW:, :],
+                _warped_ctx_v,
+            )
             region_masks = None
             if completion_enabled:
                 local_states_eval = v_states[:, target_idx - 1:target_idx + 1]
@@ -2420,10 +2506,10 @@ def main(args, resume_preempt=False):
                         }
             return {
                 "imgs": v_imgs,
-                "preds_next": preds_v[:, -HW:, :],
+                "preds_next": preds_v_next,
                 "h_tgt_eval": h_tgt_eval,
                 "h_tgt_last": h_tgt_last,
-                "h_pred_last": preds_v[0, -HW:, -layer_dim:],
+                "h_pred_last": preds_v_next[0, :, -layer_dim:],
                 "rel_action": v_actions[0, target_idx - 1],
                 "region_masks": region_masks,
             }
@@ -2693,6 +2779,7 @@ def main(args, resume_preempt=False):
                         autocast_enabled=True,
                         dtype_name=dtype_name_eval,
                         per_layer_balance=per_layer_balance,
+                        residual_target=(residual_target and residual_target_reconstruct),
                         eval_seed=int(os.environ.get("CAMERA_ROLLOUT_EVAL_SEED", "0")),
                     )
                     logger.info(
@@ -3120,10 +3207,14 @@ def main(args, resume_preempt=False):
                         intrinsics=local_intrinsics_window,
                         target_depth=target_depth,
                     )
+                    pred_slice = _reconstruct_residual_prediction(
+                        preds[:, -HW:, :],
+                        warped_ctx_raw,
+                    )
                     fsq_slice = fsq_logits[:, -HW:, :, :] if fsq_logits is not None else None
                     if delta_preds is not None:
-                        return preds[:, -HW:, :], delta_preds[:, -HW:, :], fsq_slice, warped_ctx_raw
-                    return preds[:, -HW:, :], None, fsq_slice, warped_ctx_raw
+                        return pred_slice, delta_preds[:, -HW:, :], fsq_slice, warped_ctx_raw
+                    return pred_slice, None, fsq_slice, warped_ctx_raw
 
                 def _get_local_trajectory(step_context_latents, target_tubelet_idx):
                     current_local_start = target_tubelet_idx - len(step_context_latents)
@@ -3177,13 +3268,19 @@ def main(args, resume_preempt=False):
                             error before the final mean. ``None`` recovers the
                             unweighted baseline exactly.
                         warped_context_raw: Optional ``(B, HW, D_concat)``.
-                            When ``residual_target`` is enabled, ``h_tgt`` is
-                            replaced by ``h_tgt - warped_context_raw`` so the
-                            predictor only models the residual beyond what
-                            projective geometry explains.
+                            When ``residual_target`` is enabled, the loss is
+                            computed in residual space. If the prediction has
+                            already been reconstructed as ``warp + delta``, we
+                            subtract the warp from both prediction and target.
                     """
                     if residual_target and warped_context_raw is not None:
-                        h_tgt = h_tgt - warped_context_raw.to(dtype=h_tgt.dtype)
+                        warp = warped_context_raw.to(
+                            device=preds.device,
+                            dtype=preds.dtype,
+                        )
+                        if residual_target_reconstruct:
+                            preds = preds - warp
+                        h_tgt = h_tgt - warp.to(dtype=h_tgt.dtype)
                     embed_dim = h_tgt.shape[-1] // n_hierarchical_layers
                     pred_chunks = preds.split(embed_dim, dim=-1)
                     h_chunks = h_tgt.split(embed_dim, dim=-1)
@@ -3245,6 +3342,33 @@ def main(args, resume_preempt=False):
                     _ss_prob_now = scheduled_sampling_prob * _ss_ramp
                 else:
                     _ss_prob_now = scheduled_sampling_prob
+
+                if rollout_context_mix_enabled:
+                    if epoch < rollout_context_mix_start_epoch:
+                        _ctx_mix_progress_now = 0.0
+                    elif epoch >= rollout_context_mix_ramp_end_epoch:
+                        _ctx_mix_progress_now = 1.0
+                    else:
+                        _ctx_mix_progress_now = (
+                            float(epoch - rollout_context_mix_start_epoch)
+                            / float(max(1, rollout_context_mix_ramp_end_epoch - rollout_context_mix_start_epoch))
+                        )
+                    _ctx_mix_lambda_now = rollout_context_mix_max_lambda * _ctx_mix_progress_now
+                    _ctx_mix_beta_a_now = (
+                        rollout_context_mix_beta_start_a
+                        + _ctx_mix_progress_now
+                        * (rollout_context_mix_beta_end_a - rollout_context_mix_beta_start_a)
+                    )
+                    _ctx_mix_beta_b_now = (
+                        rollout_context_mix_beta_start_b
+                        + _ctx_mix_progress_now
+                        * (rollout_context_mix_beta_end_b - rollout_context_mix_beta_start_b)
+                    )
+                else:
+                    _ctx_mix_progress_now = 1.0
+                    _ctx_mix_lambda_now = 1.0
+                    _ctx_mix_beta_a_now = None
+                    _ctx_mix_beta_b_now = None
 
                 # Phase R cycle weight: computed once per epoch above the
                 # iter loop (it's a function of ``epoch`` only). Variable
@@ -3540,15 +3664,25 @@ def main(args, resume_preempt=False):
                                 birth_bnd_mean_meter.update(
                                     float(_bnd_flat.mean().item()))
 
-                        step_losses.append(
-                            loss_fn(
+                        main_step_loss = loss_fn(
+                            pred_final,
+                            h_tgt_this,
+                            sample_weights=sample_w,
+                            warped_context_raw=warped_ctx_raw,
+                            unseen_boundary_mask=unseen_boundary_mask,
+                        )
+                        if (
+                            residual_target
+                            and residual_full_loss_weight > 0.0
+                            and warped_ctx_raw is not None
+                        ):
+                            main_step_loss = main_step_loss + residual_full_loss_weight * loss_fn(
                                 pred_final,
                                 h_tgt_this,
                                 sample_weights=sample_w,
-                                warped_context_raw=warped_ctx_raw,
                                 unseen_boundary_mask=unseen_boundary_mask,
                             )
-                        )
+                        step_losses.append(main_step_loss)
                         if (
                             latent_patchgan_enabled
                             and latent_patchgan is not None
@@ -4228,6 +4362,47 @@ def main(args, resume_preempt=False):
                                     _tgt_scale * rollout_noise_std
                                 )
                                 _next_slot = _next_slot + _noise
+                            if rollout_context_mix_enabled:
+                                if rollout_context_mix_mode == "beta":
+                                    if _ctx_mix_progress_now <= 0.0:
+                                        _ctx_mix_lambda = _next_slot.new_zeros(
+                                            (_next_slot.shape[0], 1, 1)
+                                        )
+                                    else:
+                                        with torch.amp.autocast("cuda", enabled=False):
+                                            _beta_dist = torch.distributions.Beta(
+                                                torch.tensor(
+                                                    float(_ctx_mix_beta_a_now),
+                                                    device=_next_slot.device,
+                                                    dtype=torch.float32,
+                                                ),
+                                                torch.tensor(
+                                                    float(_ctx_mix_beta_b_now),
+                                                    device=_next_slot.device,
+                                                    dtype=torch.float32,
+                                                ),
+                                            )
+                                            _ctx_mix_lambda = _beta_dist.sample(
+                                                (_next_slot.shape[0], 1, 1)
+                                            )
+                                        _ctx_mix_lambda = _ctx_mix_lambda.to(
+                                            device=_next_slot.device,
+                                            dtype=_next_slot.dtype,
+                                        )
+                                        _ctx_mix_lambda = (
+                                            _ctx_mix_lambda
+                                            * _ctx_mix_progress_now
+                                            * rollout_context_mix_max_lambda
+                                        ).clamp(0.0, 1.0)
+                                else:
+                                    _ctx_mix_lambda = _next_slot.new_full(
+                                        (_next_slot.shape[0], 1, 1),
+                                        float(_ctx_mix_lambda_now),
+                                    )
+                                _next_slot = (
+                                    (1.0 - _ctx_mix_lambda) * h_tgt_this.detach()
+                                    + _ctx_mix_lambda * _next_slot
+                                )
                         else:
                             _next_slot = h_tgt_this.detach()
                         rollout_context_latents = (rollout_context_latents + [_next_slot])[-k_ctx:]
